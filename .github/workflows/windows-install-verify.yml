@@ -347,7 +347,11 @@ jobs:
           # Skipped on purpose in this environment. Not counted as a pass; reported as NOT MEASURED.
           #   device_activation : activation is intentionally skipped (-NoActivate)
           #   mcp_registration  : Claude Desktop is not installed on the runner
-          $skipIds = @("device_activation", "mcp_registration")
+          #   devtools          : Claude Code is not installed on the runner
+          #   NOTE: these are limits of THIS environment, not product defects.
+          #         They are listed in "not_measured" of the attestation, so they
+          #         are never silently treated as a pass.
+          $skipIds = @("device_activation", "mcp_registration", "devtools")
           $ok = 0; $fail = 0; $unm = 0
           foreach ($it in $items) {
             $id = "$($it.id)"
@@ -415,6 +419,7 @@ jobs:
               "Standard user / UAC enabled / domain-joined permissions: runner is admin with UAC off",
               "Claude Desktop actually loading the config: the app is not on the runner",
               "Device activation: intentionally skipped via -NoActivate",
+              "Prerequisite developer tools (Claude Code): not installed on the runner",
               "Double-click launch: requires GUI interaction"
             )
           }
