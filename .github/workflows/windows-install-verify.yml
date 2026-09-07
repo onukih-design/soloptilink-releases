@@ -252,6 +252,21 @@ jobs:
             Write-Host "admin-only leak: none"
           }
 
+          # (d2) 担当ロールが置かれたか (2026-09-08 追加)
+          #   Windows の入口だけ、同梱されている担当ロールを置く処理が 1 行も無かった。
+          #   Mac / Linux / Web は置いており、Windows のお客様だけ編成の規模が違う
+          #   成果物になっていた。それでも導入は「完了」と表示されていた。
+          $agentsDir = Join-Path $env:USERPROFILE ".claude\agents"
+          $agents = 0
+          if (Test-Path $agentsDir) {
+            $agents = (Get-ChildItem -Path $agentsDir -Filter *.md -File -ErrorAction SilentlyContinue).Count
+          }
+          Write-Host "agent definitions placed: $agents"
+          if ($agents -lt 1) {
+            Write-Host "::error::No agent definitions were placed - Windows customers would get a smaller roster than Mac customers."
+            $ok = $false
+          }
+
           # (d) 自動更新フックが登録されたか (これが無いと以後の更新が永久に届かない)
           $settings = Join-Path $env:USERPROFILE ".claude\settings.json"
           $hook = 0
@@ -268,6 +283,7 @@ jobs:
           "skills_dirs=$n"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "boost_bytes=$bsize" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "admin_leak=$($leak.Count)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "agents=$agents"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "hook=$hook"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           if (-not $ok) { exit 1 }
 
@@ -406,6 +422,7 @@ jobs:
               skills_dirs                 = "${{ steps.placed.outputs.skills_dirs }}"
               boost_bytes                 = "${{ steps.placed.outputs.boost_bytes }}"
               admin_leak                  = "${{ steps.placed.outputs.admin_leak }}"
+              agents_placed               = "${{ steps.placed.outputs.agents }}"
               autoupdate_hook             = "${{ steps.placed.outputs.hook }}"
               exe_ran                     = "${{ steps.exe.outputs.ran }}"
               selfcheck_pass              = "${{ steps.verdict.outputs.pass_n }}"
