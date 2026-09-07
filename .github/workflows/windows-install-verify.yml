@@ -331,116 +331,102 @@ jobs:
 
       - name: 自己診断の判定を読む
         id: verdict
-        shell: bash
+        shell: powershell
         run: |
-          python - "$RUNNER_TEMP/selfcheck.json" <<'PY'
-import json, os, sys
-p = sys.argv[1]
-try:
-    with open(p, encoding="utf-8") as f:
-        d = json.load(f)
-except Exception as e:
-    print("::error::自己診断の判定を読めませんでした: %s" % e)
-    sys.exit(1)
-
-items = d.get("checks") or d.get("items") or d.get("results") or []
-if isinstance(d, list):
-    items = d
-if not items:
-    print("::error::自己診断の判定が空です (測れていない = 合格ではない)")
-    sys.exit(1)
-
-# 端末認証は -NoActivate で意図的に行っていない。
-# 「行っていない」ことを合格に数えず、未測定として明示する。
-SKIP_KEYS = ("activation", "device", "端末", "登録", "契約")
-
-fail, unmeasured, ok = [], [], []
-for it in items:
-    if not isinstance(it, dict):
-        continue
-    st  = str(it.get("status") or it.get("result") or "").upper()
-    key = str(it.get("id") or it.get("key") or it.get("name") or "?")
-    lab = str(it.get("label") or it.get("title") or key)
-    blob = (key + " " + lab).lower()
-    if any(s in blob for s in SKIP_KEYS):
-        unmeasured.append(lab + " (端末認証を行っていないため未測定)")
-        continue
-    if st in ("PASS", "OK", "GOOD"):
-        ok.append(lab)
-    elif st in ("FAIL", "NG", "ERROR", "BLOCKED"):
-        fail.append("%s: %s" % (lab, it.get("detail") or it.get("message") or ""))
-    else:
-        unmeasured.append("%s (%s)" % (lab, st or "状態不明"))
-
-print("合格 %d / 不合格 %d / 未測定 %d" % (len(ok), len(fail), len(unmeasured)))
-for f in fail:
-    print("::error::自己診断の不合格 — %s" % f)
-for u in unmeasured:
-    print("::warning::未測定 — %s" % u)
-
-out = os.environ.get("GITHUB_OUTPUT")
-if out:
-    with open(out, "a", encoding="utf-8") as g:
-        g.write("pass_n=%d\n" % len(ok))
-        g.write("fail_n=%d\n" % len(fail))
-        g.write("unmeasured_n=%d\n" % len(unmeasured))
-
-sys.exit(1 if fail else 0)
-PY
-
-      # ── 7. 証跡を出す ──────────────────────────────────────────────────
-      #   ★管理者端末が取り込んで、実機証跡とは別枠で記録する。
+          $ErrorActionPreference = "Continue"
+          $raw = Get-Content -Raw "$env:RUNNER_TEMP\selfcheck.json"
+          try { $d = $raw | ConvertFrom-Json } catch {
+            Write-Host "::error::自己診断の判定を読めませんでした (測れていない = 合格ではない)"
+            exit 1
+          }
+          $items = $null
+          foreach ($k in @("checks","items","results")) {
+            if ($d.PSObject.Properties.Name -contains $k) { $items = $d.$k; break }
+          }
+          if (-not $items -and ($d -is [System.Array])) { $items = $d }
+          if (-not $items) {
+            Write-Host "::error::自己診断の判定が空です (測れていない = 合格ではない)"
+            exit 1
+          }
+          # 端末認証は -NoActivate で意図的に行っていない。
+          # 「行っていない」を合格に数えず、未測定として明示する。
+          $skip = @("activation","device","端末","登録","契約")
+          $ok = 0; $fail = 0; $unm = 0
+          foreach ($it in $items) {
+            $key = "$($it.id) $($it.key) $($it.name) $($it.label) $($it.title)"
+            $st  = ("$($it.status)$($it.result)").ToUpper()
+            $isSkip = $false
+            foreach ($s in $skip) { if ($key -like "*$s*") { $isSkip = $true; break } }
+            if ($isSkip) {
+              $unm++
+              Write-Host "::warning::未測定 — $key (端末認証を行っていないため)"
+              continue
+            }
+            if ($st -match "PASS|OK|GOOD") { $ok++ }
+            elseif ($st -match "FAIL|NG|ERROR|BLOCKED") {
+              $fail++
+              Write-Host "::error::自己診断の不合格 — $key $($it.detail)"
+            } else {
+              $unm++
+              Write-Host "::warning::未測定 — $key ($st)"
+            }
+          }
+          Write-Host "合格 $ok / 不合格 $fail / 未測定 $unm"
+          "pass_n=$ok"        | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "fail_n=$fail"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "unmeasured_n=$unm" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if ($fail -gt 0) { exit 1 }
       - name: 証跡を作成
         if: always()
-        shell: bash
+        shell: powershell
         run: |
-          mkdir -p "$RUNNER_TEMP/attest"
-          cat > "$RUNNER_TEMP/attest/windows-ci-attestation.json" <<EOF
-{
-  "kind": "machine",
-  "version": "${{ inputs.version }}",
-  "result": "${{ job.status }}",
-  "at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-  "runner": {
-    "os": "${{ steps.env.outputs.osversion }}",
-    "powershell": "${{ steps.env.outputs.psversion }}",
-    "edition": "${{ steps.env.outputs.psedition }}",
-    "ansi_codepage": "${{ steps.env.outputs.acp }}",
-    "culture": "${{ steps.env.outputs.culture }}"
-  },
-  "package": {
-    "bytes": "${{ steps.fetch.outputs.bytes }}",
-    "sha256": "${{ steps.fetch.outputs.sha256 }}",
-    "sha256_verified": "${{ steps.sha.outputs.verified }}"
-  },
-  "stages": {
-    "syntax_errors": "${{ steps.syntax.outputs.errors }}",
-    "install_seconds": "${{ steps.install.outputs.seconds }}",
-    "installer_exit_code_ignored": "${{ steps.install.outputs.rc }}",
-    "halted_at": "${{ steps.halt.outputs.halted }}",
-    "skills_dirs": "${{ steps.placed.outputs.skills_dirs }}",
-    "boost_bytes": "${{ steps.placed.outputs.boost_bytes }}",
-    "admin_leak": "${{ steps.placed.outputs.admin_leak }}",
-    "autoupdate_hook": "${{ steps.placed.outputs.hook }}",
-    "exe_ran": "${{ steps.exe.outputs.ran }}",
-    "selfcheck_pass": "${{ steps.verdict.outputs.pass_n }}",
-    "selfcheck_fail": "${{ steps.verdict.outputs.fail_n }}",
-    "selfcheck_unmeasured": "${{ steps.verdict.outputs.unmeasured_n }}"
-  },
-  "not_measured": [
-    "日本語 Windows (システムの ANSI が cp932) での実走 — ロケール変更に再起動が要るため自動実行環境では再現できない",
-    "winget 経由の前提ソフト自動導入 — ランナーに winget が無い",
-    "スマートアプリコントロール有効機での挙動 — Server にこの機能が無い",
-    "標準ユーザー / UAC 有効 / ドメイン参加端末での権限まわり — ランナーは管理者・UAC 無効",
-    "Claude Desktop 実体が設定を読み込むところ — アプリがランナーに無い",
-    "端末認証 — -NoActivate で意図的に行っていない",
-    "ダブルクリックでの起動 — GUI 操作を伴う"
-  ]
-}
-EOF
-          echo "--- 証跡 ---"
-          cat "$RUNNER_TEMP/attest/windows-ci-attestation.json"
-
+          $dir = "$env:RUNNER_TEMP\attest"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $rec = [ordered]@{
+            kind    = "machine"
+            version = "${{ inputs.version }}"
+            result  = "${{ job.status }}"
+            at      = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            runner  = [ordered]@{
+              os            = "${{ steps.env.outputs.osversion }}"
+              powershell    = "${{ steps.env.outputs.psversion }}"
+              edition       = "${{ steps.env.outputs.psedition }}"
+              ansi_codepage = "${{ steps.env.outputs.acp }}"
+              culture       = "${{ steps.env.outputs.culture }}"
+            }
+            package = [ordered]@{
+              bytes           = "${{ steps.fetch.outputs.bytes }}"
+              sha256          = "${{ steps.fetch.outputs.sha256 }}"
+              sha256_verified = "${{ steps.sha.outputs.verified }}"
+            }
+            stages = [ordered]@{
+              syntax_errors               = "${{ steps.syntax.outputs.errors }}"
+              install_seconds             = "${{ steps.install.outputs.seconds }}"
+              installer_exit_code_ignored = "${{ steps.install.outputs.rc }}"
+              halted_at                   = "${{ steps.halt.outputs.halted }}"
+              skills_dirs                 = "${{ steps.placed.outputs.skills_dirs }}"
+              boost_bytes                 = "${{ steps.placed.outputs.boost_bytes }}"
+              admin_leak                  = "${{ steps.placed.outputs.admin_leak }}"
+              autoupdate_hook             = "${{ steps.placed.outputs.hook }}"
+              exe_ran                     = "${{ steps.exe.outputs.ran }}"
+              selfcheck_pass              = "${{ steps.verdict.outputs.pass_n }}"
+              selfcheck_fail              = "${{ steps.verdict.outputs.fail_n }}"
+              selfcheck_unmeasured        = "${{ steps.verdict.outputs.unmeasured_n }}"
+            }
+            not_measured = @(
+              "日本語 Windows (システムの ANSI が cp932) での実走 — ロケール変更に再起動が要るため自動実行環境では再現できない",
+              "winget 経由の前提ソフト自動導入 — ランナーに winget が無い",
+              "スマートアプリコントロール有効機での挙動 — Server にこの機能が無い",
+              "標準ユーザー / UAC 有効 / ドメイン参加端末での権限まわり — ランナーは管理者・UAC 無効",
+              "Claude Desktop 実体が設定を読み込むところ — アプリがランナーに無い",
+              "端末認証 — -NoActivate で意図的に行っていない",
+              "ダブルクリックでの起動 — GUI 操作を伴う"
+            )
+          }
+          $json = $rec | ConvertTo-Json -Depth 6
+          [System.IO.File]::WriteAllText("$dir\windows-ci-attestation.json", $json, (New-Object System.Text.UTF8Encoding($false)))
+          Write-Host "--- 証跡 ---"
+          Write-Host $json
       - name: 証跡を保存
         if: always()
         uses: actions/upload-artifact@v4
