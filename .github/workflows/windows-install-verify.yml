@@ -1,0 +1,539 @@
+# SoloptiLinkAI — Windows 導入の実証 (機械実証)
+#
+# 【これは何か】
+#   公開済みの Windows 配布物を、本物の Windows 上で実際に導入して通し、
+#   お客様の端末で起きることを配信前に機械で確かめる。
+#
+# 【なぜ要るか — 2026-09-07 実測】
+#   Windows について測っていたのは配布物の静的検分 (W1〜W7) だけで、
+#   「実際に走らせる」軸が 1 本も無かった。実走に相当するのは実機の証跡のみで、
+#   それが無い間は配信が止まる (G13b-WIN-LIVE = BLOCKED / 既定で有効)。
+#   結果、実機を手配できない日は配信そのものが止まり、
+#   止めない運用にすると Windows 固有の不具合はお客様の端末が初回実行の場になっていた
+#   (この型が過去 8 回再発)。
+#
+# 【設計の要点 — ここを外すと偽合格になる】
+#   ① インストーラは最後に無条件で exit 0 する (soloptilink-install.ps1:2051)。
+#      よって終了コードを合否に使わない。判定は self-check.sh の JSON を読む。
+#   ② self-check の自己申告だけに頼らず、置かれた物をファイルの実在で独立に数える。
+#   ③ 端末認証 (-NoActivate で抑止) は測っていない。測っていないものを合格にしない。
+#   ④ 日本語 Windows (システムの ANSI が cp932) は再起動が要るため再現できない。
+#      本ワークフローの cp932 ジョブは「近似」であって実機と同等ではない。
+#
+# 【秘密情報】
+#   1 件も要らない。配布物は公開リリースから匿名で取得し (HTTP 200 実測)、
+#   端末認証は -NoActivate で行わない。署名鍵は管理者端末から出さない。
+#
+# 【置き場所】
+#   公開リポジトリ onukih-design/soloptilink-releases の .github/workflows/
+#   (公開リポジトリの Windows ランナーは無料。プライベートに置くと分単位課金 + Windows は倍率 2 倍)
+
+name: Windows 導入の実証
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "検証する版 (例: 2056.6)"
+        required: true
+        type: string
+      expect_sha256:
+        description: "Windows ZIP の SHA256 (指定すると照合する。省略時は照合しない=その旨を証跡に残す)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  install-verify:
+    name: 導入を通しで実証 (Windows Server / PowerShell 5.1)
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      # ── 0. 実行環境そのものを記録する ───────────────────────────────────
+      #   何の上で測ったか分からない証跡は、後から根拠に使えない。
+      - name: 実行環境を記録
+        id: env
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $psv  = $PSVersionTable.PSVersion.ToString()
+          $psed = $PSVersionTable.PSEdition
+          $os   = [System.Environment]::OSVersion.VersionString
+          $acp  = (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage" -Name ACP).ACP
+          $oemcp= (Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Nls\CodePage" -Name OEMCP).OEMCP
+          $loc  = (Get-Culture).Name
+          Write-Host "PSVersion=$psv Edition=$psed"
+          Write-Host "OS=$os"
+          Write-Host "ACP=$acp OEMCP=$oemcp Culture=$loc"
+          "psversion=$psv"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "psedition=$psed"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "osversion=$os"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "acp=$acp"         | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "culture=$loc"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          # PowerShell 5.1 (Desktop) でなければ、顧客と同じ実行系ではない = 実証にならない
+          if ($psed -ne "Desktop") {
+            Write-Host "::error::PowerShell Desktop (5.1) ではありません。顧客と同じ実行系でないため実証になりません。"
+            exit 1
+          }
+
+      # ── 1. 配布物を公開リリースから取得 (秘密情報ゼロ) ────────────────
+      - name: 配布物を取得
+        id: fetch
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = "${{ inputs.version }}".TrimStart("v")
+          $url = "https://github.com/${{ github.repository }}/releases/download/v$ver/SoloptiLinkAI_v${ver}_Windows.zip"
+          Write-Host "取得元: $url"
+          $out = "$env:RUNNER_TEMP\win.zip"
+          # 認証情報を一切使わない (お客様と同じ条件で取得できることを同時に確かめる)
+          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+          $size = (Get-Item $out).Length
+          $sha  = (Get-FileHash $out -Algorithm SHA256).Hash.ToLower()
+          Write-Host "bytes=$size sha256=$sha"
+          if ($size -lt 1048576) {
+            Write-Host "::error::取得した配布物が 1MB 未満です (bytes=$size)。空または壊れています。"
+            exit 1
+          }
+          "zip=$out"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "bytes=$size"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sha256=$sha"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: SHA256 を照合
+        id: sha
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $expect = "${{ inputs.expect_sha256 }}".Trim().ToLower()
+          $actual = "${{ steps.fetch.outputs.sha256 }}"
+          if ([string]::IsNullOrWhiteSpace($expect)) {
+            # 照合しなかったことを黙って通さない。証跡に残して未照合と分かるようにする。
+            Write-Host "::warning::期待値が指定されていないため SHA256 を照合していません (未照合として証跡に残ります)"
+            "verified=not_requested" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } elseif ($expect -eq $actual) {
+            Write-Host "SHA256 一致"
+            "verified=match" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          } else {
+            Write-Host "::error::SHA256 不一致 expect=$expect actual=$actual — 手元の正本と違うものを検証しても意味がないため中止します"
+            exit 1
+          }
+
+      - name: 展開
+        id: extract
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dst = "$env:RUNNER_TEMP\pkg"
+          Expand-Archive -Path "${{ steps.fetch.outputs.zip }}" -DestinationPath $dst -Force
+          # ZIP 直下に 1 段フォルダが入る作りなので、installer を持つ階層を探す
+          $root = $dst
+          $cand = Get-ChildItem -Path $dst -Directory | Where-Object {
+                    Test-Path (Join-Path $_.FullName "installer\soloptilink-install.ps1") }
+          if ($cand) { $root = $cand[0].FullName }
+          $ps1 = Join-Path $root "installer\soloptilink-install.ps1"
+          if (-not (Test-Path $ps1)) {
+            Write-Host "::error::インストーラ本体が見つかりません: $ps1"
+            Get-ChildItem -Path $dst -Recurse -Depth 2 | Select-Object -First 40 FullName | Format-Table -AutoSize
+            exit 1
+          }
+          # 空ファイル耐性: 在ることと中身があることは別
+          if ((Get-Item $ps1).Length -lt 1024) {
+            Write-Host "::error::インストーラ本体が 1KB 未満です (空または壊れています)"
+            exit 1
+          }
+          Write-Host "root=$root"
+          "root=$root" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "ps1=$ps1"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # ── 2. 構文が 5.1 で通るか (段階 1) ────────────────────────────────
+      #   実走の前に構文だけを見る。ここで落ちれば実走は必ず落ちるので、原因が絞れる。
+      - name: 構文を確認 (PowerShell 5.1)
+        id: syntax
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $errs = $null
+          $null = [System.Management.Automation.PSParser]::Tokenize(
+                    (Get-Content -Raw "${{ steps.extract.outputs.ps1 }}"), [ref]$errs)
+          $n = if ($errs) { $errs.Count } else { 0 }
+          Write-Host "構文エラー: $n 件"
+          if ($n -gt 0) {
+            $errs | Select-Object -First 10 | ForEach-Object {
+              Write-Host ("  line {0}: {1}" -f $_.Token.StartLine, $_.Message) }
+            Write-Host "::error::PowerShell 5.1 で構文エラー $n 件 — お客様の端末では起動直後に落ちます"
+            exit 1
+          }
+          "errors=0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # ── 3. 導入を実走 (段階 2) ─────────────────────────────────────────
+      #   ★終了コードは判定に使わない (インストーラは無条件 exit 0)。
+      #     ここでは「最後まで到達したか」を、インストーラ自身が残す記録から読む。
+      - name: 導入を実走 (PowerShell 5.1 / 端末認証なし)
+        id: install
+        shell: powershell
+        env:
+          SOLOPTILINK_NO_END_PAUSE: "1"
+        run: |
+          $ErrorActionPreference = "Continue"
+          $t0 = Get-Date
+          & "${{ steps.extract.outputs.ps1 }}" -NoActivate 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\install.log"
+          $rc = $LASTEXITCODE
+          $sec = [int]((Get-Date) - $t0).TotalSeconds
+          Write-Host "----- インストーラの終了コード: $rc (判定には使いません) / 所要 $sec 秒 -----"
+          "rc=$rc"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "seconds=$sec" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: 止まった工程を判定
+        id: halt
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          # インストーラは失敗時に setup_detail.txt へ installer-failure step=N/11 を残す
+          $detail = Get-ChildItem -Path "$env:USERPROFILE" -Filter "setup_detail.txt" -Recurse -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+          $halted = ""
+          if ($detail) {
+            $line = Select-String -Path $detail.FullName -Pattern "installer-failure" -SimpleMatch |
+                    Select-Object -First 1
+            if ($line) { $halted = $line.Line.Trim() }
+          }
+          if ($halted) {
+            Write-Host "::error::導入が途中で止まりました: $halted"
+            "halted=$halted" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 1
+          }
+          Write-Host "途中で止まった記録はありません"
+          "halted=" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # ── 4. 置かれた物を独立に数える (段階 3) ──────────────────────────
+      #   ★インストーラの自己申告ではなく、ファイルの実在で数える。
+      #     「同梱されたか」ではなく「お客様の Claude が読む場所に置かれたか」を見る。
+      - name: 置かれた物を数える
+        id: placed
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $skills = Join-Path $env:USERPROFILE ".claude\skills"
+          $ok = $true
+
+          # (a) 呼び出し口が置かれたか
+          $n = 0
+          if (Test-Path $skills) {
+            $n = (Get-ChildItem -Path $skills -Directory -ErrorAction SilentlyContinue).Count
+          }
+          Write-Host "skills 配下のフォルダ数: $n"
+          if ($n -lt 1) {
+            Write-Host "::error::呼び出し口が 1 件も置かれていません — 案内どおり打っても何も起きない状態です"
+            $ok = $false
+          }
+
+          # (b) boost の本文が実在し、空でないか (在ることと中身があることは別)
+          $boost = Join-Path $skills "soloptilink-boost\SKILL.md"
+          $bsize = 0
+          if (Test-Path $boost) { $bsize = (Get-Item $boost).Length }
+          Write-Host "soloptilink-boost/SKILL.md: $bsize バイト"
+          if ($bsize -lt 1024) {
+            Write-Host "::error::/soloptilink-boost の本文が実在しないか空です (bytes=$bsize)"
+            $ok = $false
+          }
+
+          # (c) 管理者専用スキルが顧客側へ漏れていないか
+          $leak = @()
+          foreach ($adm in @("soloptilink-release","soloptilink-deploy","soloptilink-doctor")) {
+            if (Test-Path (Join-Path $skills $adm)) { $leak += $adm }
+          }
+          if ($leak.Count -gt 0) {
+            Write-Host ("::error::管理者専用の機能がお客様側へ置かれています: " + ($leak -join ", "))
+            $ok = $false
+          } else {
+            Write-Host "管理者専用スキルの漏れ: なし"
+          }
+
+          # (d) 自動更新フックが登録されたか (これが無いと以後の更新が永久に届かない)
+          $settings = Join-Path $env:USERPROFILE ".claude\settings.json"
+          $hook = 0
+          if (Test-Path $settings) {
+            $raw = Get-Content -Raw $settings
+            if ($raw -match "hook-autoupdate" -or $raw -match "auto-update") { $hook = 1 }
+          }
+          Write-Host "自動更新フックの登録: $hook"
+          if ($hook -ne 1) {
+            Write-Host "::error::自動更新フックが登録されていません — このお客様には以後の更新が届きません"
+            $ok = $false
+          }
+
+          "skills_dirs=$n"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "boost_bytes=$bsize" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "admin_leak=$($leak.Count)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "hook=$hook"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if (-not $ok) { exit 1 }
+
+      # ── 5. 置いたものが動く (段階 4) ───────────────────────────────────
+      - name: 本体が起動するか
+        id: exe
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $exe = Join-Path $env:USERPROFILE ".soloptilink\soloptilink.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Host "::error::本体の実行ファイルが配置されていません: $exe"
+            exit 1
+          }
+          $size = (Get-Item $exe).Length
+          Write-Host "exe: $size バイト"
+          $out = & $exe --version 2>&1 | Out-String
+          $rc  = $LASTEXITCODE
+          Write-Host "--version 出力: $out"
+          Write-Host "--version 終了コード: $rc"
+          if ([string]::IsNullOrWhiteSpace($out)) {
+            Write-Host "::error::本体を起動しても何も応答しません (配置されたが動かない状態)"
+            exit 1
+          }
+          "bytes=$size" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "ran=1"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # ── 6. 出荷物自身の自己診断 (オラクル) ────────────────────────────
+      #   ★ここが合否の主判定。インストーラの終了コードではなくこれを読む。
+      #     Git Bash (C:\Program Files\Git\bin\bash.exe) は runner に既定で入っており、
+      #     インストーラが探す既定パスと一致する。
+      - name: 自己診断を実行
+        id: selfcheck
+        shell: bash
+        run: |
+          set -o pipefail
+          SC="$USERPROFILE/.soloptilink/installer/self-check.sh"
+          SC_WIN="${{ steps.extract.outputs.root }}/installer/self-check.sh"
+          # 配置後の本体側を第一の出典にし、無ければ配布物側を使う
+          if [ -f "$SC" ]; then TARGET="$SC"; SRC="installed";
+          elif [ -f "$SC_WIN" ]; then TARGET="$SC_WIN"; SRC="package";
+          else
+            echo "::error::自己診断が見つかりません (installed/package いずれにも無い)"
+            exit 1
+          fi
+          echo "自己診断の出典: $SRC ($TARGET)"
+          set +e
+          bash "$TARGET" json > "$RUNNER_TEMP/selfcheck.json" 2> "$RUNNER_TEMP/selfcheck.err"
+          RC=$?
+          set -e
+          echo "自己診断の終了コード: $RC"
+          if [ ! -s "$RUNNER_TEMP/selfcheck.json" ]; then
+            echo "::error::自己診断が判定を 1 件も出しませんでした (測れていない = 合格ではない)"
+            cat "$RUNNER_TEMP/selfcheck.err" 2>/dev/null | head -20
+            exit 1
+          fi
+          echo "sc_rc=$RC"   >> "$GITHUB_OUTPUT"
+          echo "sc_src=$SRC" >> "$GITHUB_OUTPUT"
+          echo "--- 判定 ---"
+          cat "$RUNNER_TEMP/selfcheck.json"
+
+      - name: 自己診断の判定を読む
+        id: verdict
+        shell: bash
+        run: |
+          python - "$RUNNER_TEMP/selfcheck.json" <<'PY'
+import json, os, sys
+p = sys.argv[1]
+try:
+    with open(p, encoding="utf-8") as f:
+        d = json.load(f)
+except Exception as e:
+    print("::error::自己診断の判定を読めませんでした: %s" % e)
+    sys.exit(1)
+
+items = d.get("checks") or d.get("items") or d.get("results") or []
+if isinstance(d, list):
+    items = d
+if not items:
+    print("::error::自己診断の判定が空です (測れていない = 合格ではない)")
+    sys.exit(1)
+
+# 端末認証は -NoActivate で意図的に行っていない。
+# 「行っていない」ことを合格に数えず、未測定として明示する。
+SKIP_KEYS = ("activation", "device", "端末", "登録", "契約")
+
+fail, unmeasured, ok = [], [], []
+for it in items:
+    if not isinstance(it, dict):
+        continue
+    st  = str(it.get("status") or it.get("result") or "").upper()
+    key = str(it.get("id") or it.get("key") or it.get("name") or "?")
+    lab = str(it.get("label") or it.get("title") or key)
+    blob = (key + " " + lab).lower()
+    if any(s in blob for s in SKIP_KEYS):
+        unmeasured.append(lab + " (端末認証を行っていないため未測定)")
+        continue
+    if st in ("PASS", "OK", "GOOD"):
+        ok.append(lab)
+    elif st in ("FAIL", "NG", "ERROR", "BLOCKED"):
+        fail.append("%s: %s" % (lab, it.get("detail") or it.get("message") or ""))
+    else:
+        unmeasured.append("%s (%s)" % (lab, st or "状態不明"))
+
+print("合格 %d / 不合格 %d / 未測定 %d" % (len(ok), len(fail), len(unmeasured)))
+for f in fail:
+    print("::error::自己診断の不合格 — %s" % f)
+for u in unmeasured:
+    print("::warning::未測定 — %s" % u)
+
+out = os.environ.get("GITHUB_OUTPUT")
+if out:
+    with open(out, "a", encoding="utf-8") as g:
+        g.write("pass_n=%d\n" % len(ok))
+        g.write("fail_n=%d\n" % len(fail))
+        g.write("unmeasured_n=%d\n" % len(unmeasured))
+
+sys.exit(1 if fail else 0)
+PY
+
+      # ── 7. 証跡を出す ──────────────────────────────────────────────────
+      #   ★管理者端末が取り込んで、実機証跡とは別枠で記録する。
+      - name: 証跡を作成
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/attest"
+          cat > "$RUNNER_TEMP/attest/windows-ci-attestation.json" <<EOF
+{
+  "kind": "machine",
+  "version": "${{ inputs.version }}",
+  "result": "${{ job.status }}",
+  "at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "runner": {
+    "os": "${{ steps.env.outputs.osversion }}",
+    "powershell": "${{ steps.env.outputs.psversion }}",
+    "edition": "${{ steps.env.outputs.psedition }}",
+    "ansi_codepage": "${{ steps.env.outputs.acp }}",
+    "culture": "${{ steps.env.outputs.culture }}"
+  },
+  "package": {
+    "bytes": "${{ steps.fetch.outputs.bytes }}",
+    "sha256": "${{ steps.fetch.outputs.sha256 }}",
+    "sha256_verified": "${{ steps.sha.outputs.verified }}"
+  },
+  "stages": {
+    "syntax_errors": "${{ steps.syntax.outputs.errors }}",
+    "install_seconds": "${{ steps.install.outputs.seconds }}",
+    "installer_exit_code_ignored": "${{ steps.install.outputs.rc }}",
+    "halted_at": "${{ steps.halt.outputs.halted }}",
+    "skills_dirs": "${{ steps.placed.outputs.skills_dirs }}",
+    "boost_bytes": "${{ steps.placed.outputs.boost_bytes }}",
+    "admin_leak": "${{ steps.placed.outputs.admin_leak }}",
+    "autoupdate_hook": "${{ steps.placed.outputs.hook }}",
+    "exe_ran": "${{ steps.exe.outputs.ran }}",
+    "selfcheck_pass": "${{ steps.verdict.outputs.pass_n }}",
+    "selfcheck_fail": "${{ steps.verdict.outputs.fail_n }}",
+    "selfcheck_unmeasured": "${{ steps.verdict.outputs.unmeasured_n }}"
+  },
+  "not_measured": [
+    "日本語 Windows (システムの ANSI が cp932) での実走 — ロケール変更に再起動が要るため自動実行環境では再現できない",
+    "winget 経由の前提ソフト自動導入 — ランナーに winget が無い",
+    "スマートアプリコントロール有効機での挙動 — Server にこの機能が無い",
+    "標準ユーザー / UAC 有効 / ドメイン参加端末での権限まわり — ランナーは管理者・UAC 無効",
+    "Claude Desktop 実体が設定を読み込むところ — アプリがランナーに無い",
+    "端末認証 — -NoActivate で意図的に行っていない",
+    "ダブルクリックでの起動 — GUI 操作を伴う"
+  ]
+}
+EOF
+          echo "--- 証跡 ---"
+          cat "$RUNNER_TEMP/attest/windows-ci-attestation.json"
+
+      - name: 証跡を保存
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-ci-attestation-${{ inputs.version }}
+          path: ${{ runner.temp }}/attest/windows-ci-attestation.json
+          retention-days: 90
+
+      - name: 実行ログを保存
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-install-log-${{ inputs.version }}
+          path: |
+            ${{ runner.temp }}/install.log
+            ${{ runner.temp }}/selfcheck.json
+            ${{ runner.temp }}/selfcheck.err
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ── 別ジョブ: cp932 近似 ─────────────────────────────────────────────────
+  #   ★これは日本語 Windows の再現ではない。「近似」である。
+  #     システムの ANSI コードページを cp932 にするには再起動が要り、
+  #     自動実行環境では不可能。ここで測れるのは
+  #     「出力の文字コードを cp932 に強制したときに処理が止まらないか」まで。
+  codepage-932-approx:
+    name: 文字コード cp932 の近似確認 (実機と同等ではない)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    continue-on-error: true   # 近似のため、これ単独では配信を止めない
+
+    steps:
+      - name: 配布物を取得して展開
+        id: prep
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = "${{ inputs.version }}".TrimStart("v")
+          $url = "https://github.com/${{ github.repository }}/releases/download/v$ver/SoloptiLinkAI_v${ver}_Windows.zip"
+          $out = "$env:RUNNER_TEMP\win.zip"
+          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+          $dst = "$env:RUNNER_TEMP\pkg"
+          Expand-Archive -Path $out -DestinationPath $dst -Force
+          $root = $dst
+          $cand = Get-ChildItem -Path $dst -Directory | Where-Object {
+                    Test-Path (Join-Path $_.FullName "installer\soloptilink-install.ps1") }
+          if ($cand) { $root = $cand[0].FullName }
+          "root=$root" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: cp932 を強制して実走
+        shell: powershell
+        env:
+          SOLOPTILINK_NO_END_PAUSE: "1"
+          PYTHONIOENCODING: "cp932"
+        run: |
+          $ErrorActionPreference = "Continue"
+          # コンソールの入出力を cp932 に寄せる (システムの ANSI は変えられない)
+          chcp 932 | Out-Null
+          [Console]::OutputEncoding = [System.Text.Encoding]::GetEncoding(932)
+          [Console]::InputEncoding  = [System.Text.Encoding]::GetEncoding(932)
+          & "${{ steps.prep.outputs.root }}\installer\soloptilink-install.ps1" -NoActivate 2>&1 |
+            Tee-Object -FilePath "$env:RUNNER_TEMP\install-932.log"
+          Write-Host "----- 終了コード $LASTEXITCODE (判定には使いません) -----"
+
+      - name: 途中で止まっていないか
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $detail = Get-ChildItem -Path "$env:USERPROFILE" -Filter "setup_detail.txt" -Recurse -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+          if ($detail) {
+            $line = Select-String -Path $detail.FullName -Pattern "installer-failure" -SimpleMatch | Select-Object -First 1
+            if ($line) {
+              Write-Host "::error::文字コードを cp932 に寄せた状態で導入が止まりました: $($line.Line.Trim())"
+              exit 1
+            }
+          }
+          # 置かれたかどうかも見る (化けても止まらず、かつ仕事をしたか)
+          $skills = Join-Path $env:USERPROFILE ".claude\skills"
+          $n = 0
+          if (Test-Path $skills) { $n = (Get-ChildItem -Path $skills -Directory -ErrorAction SilentlyContinue).Count }
+          Write-Host "cp932 近似での配置件数: $n"
+          if ($n -lt 1) {
+            Write-Host "::error::cp932 を強制すると呼び出し口が置かれません"
+            exit 1
+          }
+          Write-Host "cp932 近似では止まらず、配置も行われました (※ 実機の日本語 Windows と同等ではありません)"
+
+      - name: ログを保存
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-cp932-log-${{ inputs.version }}
+          path: ${{ runner.temp }}/install-932.log
+          retention-days: 30
+          if-no-files-found: warn
