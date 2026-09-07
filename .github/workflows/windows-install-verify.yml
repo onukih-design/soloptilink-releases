@@ -75,7 +75,7 @@ jobs:
           "culture=$loc"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           # PowerShell 5.1 (Desktop) でなければ、顧客と同じ実行系ではない = 実証にならない
           if ($psed -ne "Desktop") {
-            Write-Host "::error::PowerShell Desktop (5.1) ではありません。顧客と同じ実行系でないため実証になりません。"
+            Write-Host "::error::Not PowerShell Desktop (5.1). Not the same runtime as customers, so this is not a valid attestation."
             exit 1
           }
 
@@ -87,7 +87,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $ver = "${{ inputs.version }}".TrimStart("v")
           $url = "https://github.com/${{ github.repository }}/releases/download/v$ver/SoloptiLinkAI_v${ver}_Windows.zip"
-          Write-Host "取得元: $url"
+          Write-Host "source: $url"
           $out = "$env:RUNNER_TEMP\win.zip"
           # 認証情報を一切使わない (お客様と同じ条件で取得できることを同時に確かめる)
           Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
@@ -95,7 +95,7 @@ jobs:
           $sha  = (Get-FileHash $out -Algorithm SHA256).Hash.ToLower()
           Write-Host "bytes=$size sha256=$sha"
           if ($size -lt 1048576) {
-            Write-Host "::error::取得した配布物が 1MB 未満です (bytes=$size)。空または壊れています。"
+            Write-Host "::error::Downloaded package is under 1MB (bytes=$size). Empty or corrupted."
             exit 1
           }
           "zip=$out"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
@@ -111,13 +111,13 @@ jobs:
           $actual = "${{ steps.fetch.outputs.sha256 }}"
           if ([string]::IsNullOrWhiteSpace($expect)) {
             # 照合しなかったことを黙って通さない。証跡に残して未照合と分かるようにする。
-            Write-Host "::warning::期待値が指定されていないため SHA256 を照合していません (未照合として証跡に残ります)"
+            Write-Host "::warning::No expected SHA256 given, so it was NOT verified (recorded as unverified)."
             "verified=not_requested" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           } elseif ($expect -eq $actual) {
-            Write-Host "SHA256 一致"
+            Write-Host "SHA256 matches"
             "verified=match" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           } else {
-            Write-Host "::error::SHA256 不一致 expect=$expect actual=$actual — 手元の正本と違うものを検証しても意味がないため中止します"
+            Write-Host "::error::SHA256 mismatch expect=$expect actual=$actual - verifying a different artifact is meaningless. Aborting."
             exit 1
           }
 
@@ -135,13 +135,13 @@ jobs:
           if ($cand) { $root = $cand[0].FullName }
           $ps1 = Join-Path $root "installer\soloptilink-install.ps1"
           if (-not (Test-Path $ps1)) {
-            Write-Host "::error::インストーラ本体が見つかりません: $ps1"
+            Write-Host "::error::Installer not found: $ps1"
             Get-ChildItem -Path $dst -Recurse -Depth 2 | Select-Object -First 40 FullName | Format-Table -AutoSize
             exit 1
           }
           # 空ファイル耐性: 在ることと中身があることは別
           if ((Get-Item $ps1).Length -lt 1024) {
-            Write-Host "::error::インストーラ本体が 1KB 未満です (空または壊れています)"
+            Write-Host "::error::Installer is under 1KB (empty or corrupted)."
             exit 1
           }
           Write-Host "root=$root"
@@ -159,11 +159,11 @@ jobs:
           $null = [System.Management.Automation.PSParser]::Tokenize(
                     (Get-Content -Raw "${{ steps.extract.outputs.ps1 }}"), [ref]$errs)
           $n = if ($errs) { $errs.Count } else { 0 }
-          Write-Host "構文エラー: $n 件"
+          Write-Host "syntax errors: $n"
           if ($n -gt 0) {
             $errs | Select-Object -First 10 | ForEach-Object {
               Write-Host ("  line {0}: {1}" -f $_.Token.StartLine, $_.Message) }
-            Write-Host "::error::PowerShell 5.1 で構文エラー $n 件 — お客様の端末では起動直後に落ちます"
+            Write-Host "::error::$n syntax error(s) under PowerShell 5.1 - customers would crash right at startup."
             exit 1
           }
           "errors=0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
@@ -182,7 +182,7 @@ jobs:
           & "${{ steps.extract.outputs.ps1 }}" -NoActivate 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\install.log"
           $rc = $LASTEXITCODE
           $sec = [int]((Get-Date) - $t0).TotalSeconds
-          Write-Host "----- インストーラの終了コード: $rc (判定には使いません) / 所要 $sec 秒 -----"
+          Write-Host "----- installer exit code: $rc (NOT used for the verdict) / elapsed ${sec}s -----"
           "rc=$rc"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "seconds=$sec" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
@@ -201,11 +201,11 @@ jobs:
             if ($line) { $halted = $line.Line.Trim() }
           }
           if ($halted) {
-            Write-Host "::error::導入が途中で止まりました: $halted"
+            Write-Host "::error::Install halted midway: $halted"
             "halted=$halted" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
             exit 1
           }
-          Write-Host "途中で止まった記録はありません"
+          Write-Host "no halt record found"
           "halted=" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       # ── 4. 置かれた物を独立に数える (段階 3) ──────────────────────────
@@ -224,9 +224,9 @@ jobs:
           if (Test-Path $skills) {
             $n = (Get-ChildItem -Path $skills -Directory -ErrorAction SilentlyContinue).Count
           }
-          Write-Host "skills 配下のフォルダ数: $n"
+          Write-Host "skill dirs: $n"
           if ($n -lt 1) {
-            Write-Host "::error::呼び出し口が 1 件も置かれていません — 案内どおり打っても何も起きない状態です"
+            Write-Host "::error::No skills were placed - typing the documented command would do nothing."
             $ok = $false
           }
 
@@ -234,9 +234,9 @@ jobs:
           $boost = Join-Path $skills "soloptilink-boost\SKILL.md"
           $bsize = 0
           if (Test-Path $boost) { $bsize = (Get-Item $boost).Length }
-          Write-Host "soloptilink-boost/SKILL.md: $bsize バイト"
+          Write-Host "soloptilink-boost/SKILL.md: $bsize bytes"
           if ($bsize -lt 1024) {
-            Write-Host "::error::/soloptilink-boost の本文が実在しないか空です (bytes=$bsize)"
+            Write-Host "::error::soloptilink-boost body is missing or empty (bytes=$bsize)."
             $ok = $false
           }
 
@@ -246,10 +246,10 @@ jobs:
             if (Test-Path (Join-Path $skills $adm)) { $leak += $adm }
           }
           if ($leak.Count -gt 0) {
-            Write-Host ("::error::管理者専用の機能がお客様側へ置かれています: " + ($leak -join ", "))
+            Write-Host ("::error::admin-only skills leaked to the customer side: " + ($leak -join ", "))
             $ok = $false
           } else {
-            Write-Host "管理者専用スキルの漏れ: なし"
+            Write-Host "admin-only leak: none"
           }
 
           # (d) 自動更新フックが登録されたか (これが無いと以後の更新が永久に届かない)
@@ -259,9 +259,9 @@ jobs:
             $raw = Get-Content -Raw $settings
             if ($raw -match "hook-autoupdate" -or $raw -match "auto-update") { $hook = 1 }
           }
-          Write-Host "自動更新フックの登録: $hook"
+          Write-Host "auto-update hook registered: $hook"
           if ($hook -ne 1) {
-            Write-Host "::error::自動更新フックが登録されていません — このお客様には以後の更新が届きません"
+            Write-Host "::error::Auto-update hook not registered - this customer would never receive updates."
             $ok = $false
           }
 
@@ -279,17 +279,17 @@ jobs:
           $ErrorActionPreference = "Continue"
           $exe = Join-Path $env:USERPROFILE ".soloptilink\soloptilink.exe"
           if (-not (Test-Path $exe)) {
-            Write-Host "::error::本体の実行ファイルが配置されていません: $exe"
+            Write-Host "::error::Launcher not placed: $exe"
             exit 1
           }
           $size = (Get-Item $exe).Length
-          Write-Host "exe: $size バイト"
+          Write-Host "exe: $size bytes"
           $out = & $exe --version 2>&1 | Out-String
           $rc  = $LASTEXITCODE
-          Write-Host "--version 出力: $out"
-          Write-Host "--version 終了コード: $rc"
+          Write-Host "--version output: $out"
+          Write-Host "--version exit code: $rc"
           if ([string]::IsNullOrWhiteSpace($out)) {
-            Write-Host "::error::本体を起動しても何も応答しません (配置されたが動かない状態)"
+            Write-Host "::error::Launcher produced no output (placed but not working)."
             exit 1
           }
           "bytes=$size" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
@@ -310,23 +310,23 @@ jobs:
           if [ -f "$SC" ]; then TARGET="$SC"; SRC="installed";
           elif [ -f "$SC_WIN" ]; then TARGET="$SC_WIN"; SRC="package";
           else
-            echo "::error::自己診断が見つかりません (installed/package いずれにも無い)"
+            echo "::error::self-check not found (neither installed nor in package)."
             exit 1
           fi
-          echo "自己診断の出典: $SRC ($TARGET)"
+          echo "self-check source: $SRC ($TARGET)"
           set +e
           bash "$TARGET" json > "$RUNNER_TEMP/selfcheck.json" 2> "$RUNNER_TEMP/selfcheck.err"
           RC=$?
           set -e
-          echo "自己診断の終了コード: $RC"
+          echo "self-check exit code: $RC"
           if [ ! -s "$RUNNER_TEMP/selfcheck.json" ]; then
-            echo "::error::自己診断が判定を 1 件も出しませんでした (測れていない = 合格ではない)"
+            echo "::error::self-check produced no verdict (not measured = not a pass)."
             cat "$RUNNER_TEMP/selfcheck.err" 2>/dev/null | head -20
             exit 1
           fi
           echo "sc_rc=$RC"   >> "$GITHUB_OUTPUT"
           echo "sc_src=$SRC" >> "$GITHUB_OUTPUT"
-          echo "--- 判定 ---"
+          echo "--- verdict ---"
           cat "$RUNNER_TEMP/selfcheck.json"
 
       - name: 自己診断の判定を読む
@@ -336,42 +336,37 @@ jobs:
           $ErrorActionPreference = "Continue"
           $raw = Get-Content -Raw "$env:RUNNER_TEMP\selfcheck.json"
           try { $d = $raw | ConvertFrom-Json } catch {
-            Write-Host "::error::自己診断の判定を読めませんでした (測れていない = 合格ではない)"
+            Write-Host "::error::Could not read self-check verdict (not measured = not a pass)."
             exit 1
           }
-          $items = $null
-          foreach ($k in @("checks","items","results")) {
-            if ($d.PSObject.Properties.Name -contains $k) { $items = $d.$k; break }
-          }
-          if (-not $items -and ($d -is [System.Array])) { $items = $d }
+          $items = $d.checks
           if (-not $items) {
-            Write-Host "::error::自己診断の判定が空です (測れていない = 合格ではない)"
+            Write-Host "::error::self-check verdict is empty (not measured = not a pass)."
             exit 1
           }
-          # 端末認証は -NoActivate で意図的に行っていない。
-          # 「行っていない」を合格に数えず、未測定として明示する。
-          $skip = @("activation","device","端末","登録","契約")
+          # Skipped on purpose in this environment. Not counted as a pass; reported as NOT MEASURED.
+          #   device_activation : activation is intentionally skipped (-NoActivate)
+          #   mcp_registration  : Claude Desktop is not installed on the runner
+          $skipIds = @("device_activation", "mcp_registration")
           $ok = 0; $fail = 0; $unm = 0
           foreach ($it in $items) {
-            $key = "$($it.id) $($it.key) $($it.name) $($it.label) $($it.title)"
-            $st  = ("$($it.status)$($it.result)").ToUpper()
-            $isSkip = $false
-            foreach ($s in $skip) { if ($key -like "*$s*") { $isSkip = $true; break } }
-            if ($isSkip) {
+            $id = "$($it.id)"
+            $v  = ("$($it.verdict)").ToUpper()
+            if ($skipIds -contains $id) {
               $unm++
-              Write-Host "::warning::未測定 — $key (端末認証を行っていないため)"
+              Write-Host "NOT MEASURED - $id (intentionally skipped in this environment)"
               continue
             }
-            if ($st -match "PASS|OK|GOOD") { $ok++ }
-            elseif ($st -match "FAIL|NG|ERROR|BLOCKED") {
+            if ($v -eq "PASS") { $ok++ }
+            elseif ($v -eq "FAIL") {
               $fail++
-              Write-Host "::error::自己診断の不合格 — $key $($it.detail)"
+              Write-Host "::error::self-check FAILED - $id : $($it.reason_ja)"
             } else {
               $unm++
-              Write-Host "::warning::未測定 — $key ($st)"
+              Write-Host "::warning::NOT MEASURED - $id ($v)"
             }
           }
-          Write-Host "合格 $ok / 不合格 $fail / 未測定 $unm"
+          Write-Host "pass $ok / fail $fail / not-measured $unm"
           "pass_n=$ok"        | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "fail_n=$fail"      | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "unmeasured_n=$unm" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
@@ -414,18 +409,18 @@ jobs:
               selfcheck_unmeasured        = "${{ steps.verdict.outputs.unmeasured_n }}"
             }
             not_measured = @(
-              "日本語 Windows (システムの ANSI が cp932) での実走 — ロケール変更に再起動が要るため自動実行環境では再現できない",
-              "winget 経由の前提ソフト自動導入 — ランナーに winget が無い",
-              "スマートアプリコントロール有効機での挙動 — Server にこの機能が無い",
-              "標準ユーザー / UAC 有効 / ドメイン参加端末での権限まわり — ランナーは管理者・UAC 無効",
-              "Claude Desktop 実体が設定を読み込むところ — アプリがランナーに無い",
-              "端末認証 — -NoActivate で意図的に行っていない",
-              "ダブルクリックでの起動 — GUI 操作を伴う"
+              "Real Japanese Windows (system ANSI = cp932): cannot be reproduced - changing the system locale requires a reboot",
+              "Prerequisite install via winget: winget is not on the runner",
+              "Smart App Control enabled machines: not available on Server",
+              "Standard user / UAC enabled / domain-joined permissions: runner is admin with UAC off",
+              "Claude Desktop actually loading the config: the app is not on the runner",
+              "Device activation: intentionally skipped via -NoActivate",
+              "Double-click launch: requires GUI interaction"
             )
           }
           $json = $rec | ConvertTo-Json -Depth 6
           [System.IO.File]::WriteAllText("$dir\windows-ci-attestation.json", $json, (New-Object System.Text.UTF8Encoding($false)))
-          Write-Host "--- 証跡 ---"
+          Write-Host "--- attestation ---"
           Write-Host $json
       - name: 証跡を保存
         if: always()
@@ -489,7 +484,7 @@ jobs:
           [Console]::InputEncoding  = [System.Text.Encoding]::GetEncoding(932)
           & "${{ steps.prep.outputs.root }}\installer\soloptilink-install.ps1" -NoActivate 2>&1 |
             Tee-Object -FilePath "$env:RUNNER_TEMP\install-932.log"
-          Write-Host "----- 終了コード $LASTEXITCODE (判定には使いません) -----"
+          Write-Host "----- exit code $LASTEXITCODE (NOT used for the verdict) -----"
 
       - name: 途中で止まっていないか
         shell: powershell
@@ -500,7 +495,7 @@ jobs:
           if ($detail) {
             $line = Select-String -Path $detail.FullName -Pattern "installer-failure" -SimpleMatch | Select-Object -First 1
             if ($line) {
-              Write-Host "::error::文字コードを cp932 に寄せた状態で導入が止まりました: $($line.Line.Trim())"
+              Write-Host "::error::Install halted while output codepage was forced to cp932: $($line.Line.Trim())"
               exit 1
             }
           }
@@ -508,12 +503,12 @@ jobs:
           $skills = Join-Path $env:USERPROFILE ".claude\skills"
           $n = 0
           if (Test-Path $skills) { $n = (Get-ChildItem -Path $skills -Directory -ErrorAction SilentlyContinue).Count }
-          Write-Host "cp932 近似での配置件数: $n"
+          Write-Host "skill dirs under cp932 approximation: $n"
           if ($n -lt 1) {
-            Write-Host "::error::cp932 を強制すると呼び出し口が置かれません"
+            Write-Host "::error::No skills placed when codepage is forced to cp932."
             exit 1
           }
-          Write-Host "cp932 近似では止まらず、配置も行われました (※ 実機の日本語 Windows と同等ではありません)"
+          Write-Host "No halt under the cp932 approximation, and skills were placed. (NOT equivalent to a real Japanese Windows.)"
 
       - name: ログを保存
         if: always()
