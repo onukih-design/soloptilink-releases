@@ -41,9 +41,22 @@ on:
         description: "Windows ZIP の SHA256 (指定すると照合する。省略時は照合しない=その旨を証跡に残す)"
         required: false
         type: string
+      source:
+        description: "配布物の取り先。public=公開済みリリース / draft=公開前の下書きリリース (お客様には見えない)"
+        required: false
+        default: public
+        type: choice
+        options:
+          - public
+          - draft
 
+# ★2026-09-29: 公開前に Windows 実機で確かめられるよう、下書き (未公開) のリリースからも取れるようにした。
+#   従来は「公開 → 実証 → 登録」の順でしか回らず、Windows で確かめないまま公開物がお客様の目に
+#   触れる時間が必ずあった。下書きのリリースはお客様から見えず、自動更新の「最新版」にもならない。
+#   下書きの一覧を読むにはこのリポジトリへの書き込み権のある鍵が要るため contents: write にしているが、
+#   このワークフローの手順はリポジトリへ一切書き込まない (取得と検証だけ)。
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   install-verify:
@@ -86,11 +99,29 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $ver = "${{ inputs.version }}".TrimStart("v")
-          $url = "https://github.com/${{ github.repository }}/releases/download/v$ver/SoloptiLinkAI_v${ver}_Windows.zip"
-          Write-Host "source: $url"
+          # 取り先の切り替え (public=匿名で取得 / draft=下書きリリースを鍵つきで取得)
+          function Get-SlPackage([string]$ver, [string]$out) {
+            $name = "SoloptiLinkAI_v${ver}_Windows.zip"
+            if ("${{ inputs.source }}" -eq "draft") {
+              $tok = "${{ github.token }}"
+              $hdr = @{ Authorization = "Bearer $tok"; "X-GitHub-Api-Version" = "2022-11-28" }
+              $rels = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100" -Headers $hdr
+              $rel = $rels | Where-Object { $_.draft -and $_.tag_name -eq "v$ver" } | Select-Object -First 1
+              if (-not $rel) { Write-Host "::error::Draft release v$ver not found"; exit 1 }
+              $asset = $rel.assets | Where-Object { $_.name -eq $name } | Select-Object -First 1
+              if (-not $asset) { Write-Host "::error::Asset $name not found in draft v$ver"; exit 1 }
+              Write-Host "source: draft release v$ver asset $name"
+              $hdr["Accept"] = "application/octet-stream"
+              Invoke-WebRequest -Uri $asset.url -Headers $hdr -OutFile $out -UseBasicParsing
+            } else {
+              $url = "https://github.com/${{ github.repository }}/releases/download/v$ver/$name"
+              Write-Host "source: $url"
+              # 認証情報を一切使わない (お客様と同じ条件で取得できることを同時に確かめる)
+              Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+            }
+          }
           $out = "$env:RUNNER_TEMP\win.zip"
-          # 認証情報を一切使わない (お客様と同じ条件で取得できることを同時に確かめる)
-          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+          Get-SlPackage $ver $out
           $size = (Get-Item $out).Length
           $sha  = (Get-FileHash $out -Algorithm SHA256).Hash.ToLower()
           Write-Host "bytes=$size sha256=$sha"
@@ -482,9 +513,29 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $ver = "${{ inputs.version }}".TrimStart("v")
-          $url = "https://github.com/${{ github.repository }}/releases/download/v$ver/SoloptiLinkAI_v${ver}_Windows.zip"
+          # 取り先の切り替え (public=匿名で取得 / draft=下書きリリースを鍵つきで取得)
+          function Get-SlPackage([string]$ver, [string]$out) {
+            $name = "SoloptiLinkAI_v${ver}_Windows.zip"
+            if ("${{ inputs.source }}" -eq "draft") {
+              $tok = "${{ github.token }}"
+              $hdr = @{ Authorization = "Bearer $tok"; "X-GitHub-Api-Version" = "2022-11-28" }
+              $rels = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100" -Headers $hdr
+              $rel = $rels | Where-Object { $_.draft -and $_.tag_name -eq "v$ver" } | Select-Object -First 1
+              if (-not $rel) { Write-Host "::error::Draft release v$ver not found"; exit 1 }
+              $asset = $rel.assets | Where-Object { $_.name -eq $name } | Select-Object -First 1
+              if (-not $asset) { Write-Host "::error::Asset $name not found in draft v$ver"; exit 1 }
+              Write-Host "source: draft release v$ver asset $name"
+              $hdr["Accept"] = "application/octet-stream"
+              Invoke-WebRequest -Uri $asset.url -Headers $hdr -OutFile $out -UseBasicParsing
+            } else {
+              $url = "https://github.com/${{ github.repository }}/releases/download/v$ver/$name"
+              Write-Host "source: $url"
+              # 認証情報を一切使わない (お客様と同じ条件で取得できることを同時に確かめる)
+              Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+            }
+          }
           $out = "$env:RUNNER_TEMP\win.zip"
-          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+          Get-SlPackage $ver $out
           $dst = "$env:RUNNER_TEMP\pkg"
           Expand-Archive -Path $out -DestinationPath $dst -Force
           $root = $dst
@@ -538,5 +589,181 @@ jobs:
         with:
           name: windows-cp932-log-${{ inputs.version }}
           path: ${{ runner.temp }}/install-932.log
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ── お客様と同じ入口・同じ置き方での実証 (2026-09-29 追加) ─────────────────
+  #   既存の実証は .ps1 を直接起動し、展開先も空白の無い場所だった。お客様は
+  #   「まず最初にこれを実行.bat」をダブルクリックし、ダウンロード由来の印が付いた ZIP を、
+  #   日本語や空白を含むフォルダ (C:\Users\山田 太郎\Downloads\SoloptiLinkAI (1)\ 等) へ展開する。
+  #   この差が原因の不具合 (空白パスで自己診断が割れる件) が、実証を通っていながら残っていた。
+  #   また同梱の全 .ps1 が、日本語 Windows の既定の読み方 (BOM 無しなら cp932) で壊れないかを見る。
+  #   ★まずは報告のみ (continue-on-error)。一度緑になったことを確かめてから止める側へ切り替える。
+  bat-entry-realistic:
+    name: お客様と同じ入口で実証 (.bat・空白と日本語のパス・ダウンロード由来の印)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - name: 配布物を取得して、お客様と同じ形で展開
+        id: prep
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = "${{ inputs.version }}".TrimStart("v")
+          # 取り先の切り替え (public=匿名で取得 / draft=下書きリリースを鍵つきで取得)
+          function Get-SlPackage([string]$ver, [string]$out) {
+            $name = "SoloptiLinkAI_v${ver}_Windows.zip"
+            if ("${{ inputs.source }}" -eq "draft") {
+              $tok = "${{ github.token }}"
+              $hdr = @{ Authorization = "Bearer $tok"; "X-GitHub-Api-Version" = "2022-11-28" }
+              $rels = Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/releases?per_page=100" -Headers $hdr
+              $rel = $rels | Where-Object { $_.draft -and $_.tag_name -eq "v$ver" } | Select-Object -First 1
+              if (-not $rel) { Write-Host "::error::Draft release v$ver not found"; exit 1 }
+              $asset = $rel.assets | Where-Object { $_.name -eq $name } | Select-Object -First 1
+              if (-not $asset) { Write-Host "::error::Asset $name not found in draft v$ver"; exit 1 }
+              Write-Host "source: draft release v$ver asset $name"
+              $hdr["Accept"] = "application/octet-stream"
+              Invoke-WebRequest -Uri $asset.url -Headers $hdr -OutFile $out -UseBasicParsing
+            } else {
+              $url = "https://github.com/${{ github.repository }}/releases/download/v$ver/$name"
+              Write-Host "source: $url"
+              # 認証情報を一切使わない (お客様と同じ条件で取得できることを同時に確かめる)
+              Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+            }
+          }
+          # 展開先: 空白と日本語を含む (文字コードの影響を受けないよう文字番号で組み立てる)
+          $jp = -join ([char[]](0x5C71, 0x7530, 0x0020, 0x592A, 0x90CE))
+          $base = Join-Path $env:RUNNER_TEMP $jp
+          $dst = Join-Path $base "SoloptiLinkAI (1)"
+          New-Item -ItemType Directory -Path $dst -Force | Out-Null
+          $zip = Join-Path $base "SoloptiLinkAI.zip"
+          Get-SlPackage $ver $zip
+          # ダウンロード由来の印 (Zone.Identifier / ZoneId=3) を ZIP に付ける
+          Set-Content -Path $zip -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3" -Encoding Ascii
+          Expand-Archive -Path $zip -DestinationPath $dst -Force
+          # エクスプローラーの「すべて展開」と同じく、展開した全ファイルへ印を引き継ぐ
+          Get-ChildItem -Path $dst -Recurse -File | ForEach-Object {
+            Set-Content -LiteralPath $_.FullName -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3" -Encoding Ascii -ErrorAction SilentlyContinue
+          }
+          $root = $dst
+          $cand = Get-ChildItem -Path $dst -Directory | Where-Object {
+                    Test-Path (Join-Path $_.FullName "installer\soloptilink-install.ps1") }
+          if ($cand) { $root = $cand[0].FullName }
+          # 最上位の起動口 (.bat) を名前ではなく場所で探す (日本語のファイル名をこの手順に書かない)
+          $bat = Get-ChildItem -Path $root -Filter "*.bat" -File | Select-Object -First 1
+          if (-not $bat) { Write-Host "::error::No .bat entry at the top of the package: $root"; exit 1 }
+          Write-Host "root=$root"
+          Write-Host "entry=$($bat.FullName)"
+          "root=$root"            | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "bat=$($bat.FullName)"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: 同梱の全 .ps1 が日本語 Windows の読み方で壊れないか
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $root = "${{ steps.prep.outputs.root }}"
+          $bad = 0; $n = 0
+          $cp932 = [System.Text.Encoding]::GetEncoding(932)
+          Get-ChildItem -Path $root -Recurse -Filter "*.ps1" -File | ForEach-Object {
+            $n++
+            $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
+            $hasBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+            if ($hasBom) { return }
+            # BOM が無いファイルは、日本語 Windows の PowerShell 5.1 が cp932 として読む
+            $text = $cp932.GetString($bytes)
+            try { [void][ScriptBlock]::Create($text) } catch {
+              $bad++
+              Write-Host ("::error::Breaks when read as cp932 (no BOM): {0} : {1}" -f $_.TargetObject, $_.Exception.Message.Split("`n")[0])
+              Write-Host ("  file: {0}" -f $_.FullName)
+            }
+          }
+          Write-Host "ps1 files=$n broken-under-cp932=$bad"
+          if ($bad -gt 0) { exit 1 }
+
+      - name: .bat から導入を実走 (端末認証なし・入力なし)
+        shell: powershell
+        env:
+          SOLOPTILINK_NO_END_PAUSE: "1"
+          SOLOPTILINK_INSTALL_NO_ACTIVATE: "1"
+        run: |
+          $ErrorActionPreference = "Continue"
+          $bat = "${{ steps.prep.outputs.bat }}"
+          $log = "$env:RUNNER_TEMP\install-bat.log"
+          $t0 = Get-Date
+          cmd /c "call `"$bat`" < nul" 2>&1 | Tee-Object -FilePath $log
+          $sec = [int]((Get-Date) - $t0).TotalSeconds
+          Write-Host "----- exit code $LASTEXITCODE (NOT used for the verdict) / elapsed ${sec}s -----"
+
+      - name: 途中で止まらず、自己診断まで届いたか
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $detail = Get-ChildItem -Path "$env:USERPROFILE" -Filter "setup_detail.txt" -Recurse -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+          if ($detail) {
+            $line = Select-String -Path $detail.FullName -Pattern "installer-failure" -SimpleMatch | Select-Object -First 1
+            if ($line) { Write-Host "::error::Install halted via the .bat entry: $($line.Line.Trim())"; exit 1 }
+          }
+          $skills = Join-Path $env:USERPROFILE ".claude\skills"
+          $n = 0
+          if (Test-Path $skills) { $n = (Get-ChildItem -Path $skills -Directory -ErrorAction SilentlyContinue).Count }
+          Write-Host "skill dirs placed via .bat entry: $n"
+          if ($n -lt 1) { Write-Host "::error::No skills placed via the .bat entry."; exit 1 }
+          # 空白を含む展開先でも自己診断が起動できたか (以前は引数が割れて exit 127 で起動できなかった)
+          $log = Get-Content "$env:RUNNER_TEMP\install-bat.log" -Raw -ErrorAction SilentlyContinue
+          if ($log -and ($log -match "self-check.*No such file|exit code 127")) {
+            Write-Host "::error::Self-check could not start under a path with spaces."; exit 1
+          }
+          Write-Host "Reached the end via the customer's entry (.bat) under a path with spaces and Japanese characters."
+
+      # ★2026-09-29: 新しい版の全スキルは起動直後に「ご利用確認」(Step 0) を行う。Windows では本体の名前が
+      #   soloptilink.exe のため、判定が通らないと契約中の Windows のお客様全員で当社の機能が使えなくなる
+      #   (Mac では砂箱で確認済み・Windows は未検証だった)。承認済みの端末と同じ記録を置き、通信先を
+      #   届かない宛先 (127.0.0.1:9) へ向けて、手元の記録での判定が AUTHORIZED になることを確かめる。
+      #   あわせて、期限切れの記録では AUTHORIZED にならないこと (判定が素通りしていないこと) も見る。
+      #   置く記録の欄は、本体が承認時に保存するもの (launcher/license.go の saveActivation / saveToken) と同じ。
+      - name: ご利用確認 (Step 0) が Windows で正しく判定されるか
+        shell: powershell
+        env:
+          SOLOPTILINK_API_URL: "https://127.0.0.1:9/api/v1"
+        run: |
+          $ErrorActionPreference = "Continue"
+          $sl = Join-Path $env:USERPROFILE ".soloptilink"
+          $bash = $null
+          foreach ($c in @("$env:ProgramFiles\Git\bin\bash.exe", "${env:ProgramFiles(x86)}\Git\bin\bash.exe")) { if (Test-Path $c) { $bash = $c; break } }
+          if (-not $bash) { Write-Host "::error::Git Bash not found (Step 0 runs in Git Bash on customer PCs)"; exit 1 }
+          if (-not (Test-Path (Join-Path $sl "lib\evict\failopen.sh"))) { Write-Host "::error::failopen.sh was not installed"; exit 1 }
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          function Write-Records([int]$days) {
+            $exp = (Get-Date).ToUniversalTime().AddDays($days).ToString("yyyy-MM-ddTHH:mm:ssZ")
+            $act = '{"email":"ci@example.test","company_code":"CI0001","device_id":"dev_ci0001","fingerprint":"fp-v2-ci","hardware_uuid":"00000000-0000-0000-0000-000000000000","activated_at":"2026-09-01T00:00:00Z","server_key_half":"Y2k="}'
+            $lic = '{"token":"tok_ci","device_id":"dev_ci0001","company_id":"","company_code":"CI0001","status":"approved","issued_at":"2026-09-01T00:00:00Z","expires_at":"' + $exp + '","signature":""}'
+            [System.IO.File]::WriteAllText((Join-Path $sl "activation.json"), $act, $utf8)
+            [System.IO.File]::WriteAllText((Join-Path $sl "license.json"), $lic, $utf8)
+            Remove-Item (Join-Path $sl ".license\.status_cache.json") -Force -ErrorAction SilentlyContinue
+            Remove-Item (Join-Path $sl ".license-revoked") -Force -ErrorAction SilentlyContinue
+          }
+          # 1) 承認済み・期限 30 日先 → AUTHORIZED であること
+          Write-Records 30
+          $ok = (& $bash -lc 'bash ~/.soloptilink/lib/evict/failopen.sh verdict 2>/dev/null || echo FAILOPEN' 2>&1 | Select-Object -Last 1)
+          Write-Host "approved (30 days ahead): $ok"
+          # 2) 承認済み・期限切れ → AUTHORIZED にならないこと (判定が素通りしていない)
+          Write-Records -2
+          $ng = (& $bash -lc 'bash ~/.soloptilink/lib/evict/failopen.sh verdict 2>/dev/null || echo FAILOPEN' 2>&1 | Select-Object -Last 1)
+          Write-Host "approved but expired: $ng"
+          # 片付け (この仮想機は使い捨てだが、次の手順に影響させない)
+          Remove-Item (Join-Path $sl "activation.json"), (Join-Path $sl "license.json") -Force -ErrorAction SilentlyContinue
+          Remove-Item (Join-Path $sl ".license\.status_cache.json") -Force -ErrorAction SilentlyContinue
+          if ("$ok".Trim() -ne "AUTHORIZED") { Write-Host "::error::Step 0 did not authorize an approved Windows device (got '$ok'). Every Windows customer would lose the product features."; exit 1 }
+          if ("$ng".Trim() -eq "AUTHORIZED") { Write-Host "::error::Step 0 authorized an expired record (got '$ng'). The check is being bypassed."; exit 1 }
+          Write-Host "Step 0 on Windows: approved=AUTHORIZED / expired=not AUTHORIZED (both sides)."
+
+      - name: ログを保存
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-bat-entry-log-${{ inputs.version }}
+          path: ${{ runner.temp }}/install-bat.log
           retention-days: 30
           if-no-files-found: warn
