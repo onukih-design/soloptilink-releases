@@ -29,6 +29,7 @@
 #   (公開リポジトリの Windows ランナーは無料。プライベートに置くと分単位課金 + Windows は倍率 2 倍)
 
 name: Windows 導入の実証
+run-name: "Windows 導入の実証 v${{ inputs.version }} (${{ inputs.source || 'public' }})"
 
 on:
   workflow_dispatch:
@@ -549,13 +550,14 @@ jobs:
         env:
           SOLOPTILINK_NO_END_PAUSE: "1"
           PYTHONIOENCODING: "cp932"
+          SL_ROOT: ${{ steps.prep.outputs.root }}
         run: |
           $ErrorActionPreference = "Continue"
           # コンソールの入出力を cp932 に寄せる (システムの ANSI は変えられない)
           chcp 932 | Out-Null
           [Console]::OutputEncoding = [System.Text.Encoding]::GetEncoding(932)
           [Console]::InputEncoding  = [System.Text.Encoding]::GetEncoding(932)
-          & "${{ steps.prep.outputs.root }}\installer\soloptilink-install.ps1" -NoActivate 2>&1 |
+          & (Join-Path $env:SL_ROOT "installer\soloptilink-install.ps1") -NoActivate 2>&1 |
             Tee-Object -FilePath "$env:RUNNER_TEMP\install-932.log"
           Write-Host "----- exit code $LASTEXITCODE (NOT used for the verdict) -----"
 
@@ -660,9 +662,13 @@ jobs:
 
       - name: 同梱の全 .ps1 が日本語 Windows の読み方で壊れないか
         shell: powershell
+        # ★日本語を含む場所は本文へ埋め込まない。PowerShell 5.1 は BOM の無い一時スクリプトを
+        #   ANSI で読むため、埋め込んだ「山田 太郎」が化けて構文エラーになる (2026-10-01 実測)。
+        env:
+          SL_ROOT: ${{ steps.prep.outputs.root }}
         run: |
           $ErrorActionPreference = "Continue"
-          $root = "${{ steps.prep.outputs.root }}"
+          $root = $env:SL_ROOT
           $bad = 0; $n = 0
           $cp932 = [System.Text.Encoding]::GetEncoding(932)
           Get-ChildItem -Path $root -Recurse -Filter "*.ps1" -File | ForEach-Object {
@@ -686,9 +692,10 @@ jobs:
         env:
           SOLOPTILINK_NO_END_PAUSE: "1"
           SOLOPTILINK_INSTALL_NO_ACTIVATE: "1"
+          SL_BAT: ${{ steps.prep.outputs.bat }}
         run: |
           $ErrorActionPreference = "Continue"
-          $bat = "${{ steps.prep.outputs.bat }}"
+          $bat = $env:SL_BAT
           $log = "$env:RUNNER_TEMP\install-bat.log"
           $t0 = Get-Date
           cmd /c "call `"$bat`" < nul" 2>&1 | Tee-Object -FilePath $log
