@@ -825,13 +825,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { id: "1-pilot-gitbash-realpy",   os: windows-latest, resp: pilot,  route: bash,   py: real, profile: ascii }
-          - { id: "2-pilot-gitbash-pystub",   os: windows-latest, resp: pilot,  route: bash,   py: stub, profile: ascii }
-          - { id: "3-pilot-nobash",           os: windows-latest, resp: pilot,  route: nobash, py: stub, profile: ascii }
-          - { id: "4-pilot-jpuser-pystub",    os: windows-latest, resp: pilot,  route: bash,   py: stub, profile: japanese }
-          - { id: "5-pilot-server2022-pystub", os: windows-2022,  resp: pilot,  route: bash,   py: stub, profile: ascii }
-          - { id: "6-full-gitbash-pystub",    os: windows-latest, resp: stable, route: bash,   py: stub, profile: ascii }
-          - { id: "7-full-nobash",            os: windows-latest, resp: stable, route: nobash, py: stub, profile: ascii }
+          - { id: "A-pilot-hook",          os: windows-latest, resp: pilot,  method: hook,       py: stub, profile: ascii }
+          - { id: "B-pilot-worker-fg",     os: windows-latest, resp: pilot,  method: worker-fg,  py: stub, profile: ascii }
+          - { id: "C-pilot-update-cli",    os: windows-latest, resp: pilot,  method: update-cli, py: stub, profile: ascii }
+          - { id: "D-pilot-force-bash",    os: windows-latest, resp: pilot,  method: force-bash, py: stub, profile: ascii }
+          - { id: "E-pilot-update-cli-jp", os: windows-latest, resp: pilot,  method: update-cli, py: stub, profile: japanese }
+          - { id: "F-full-hook",           os: windows-latest, resp: stable, method: hook,       py: stub, profile: ascii }
+          - { id: "G-full-update-cli",     os: windows-latest, resp: stable, method: update-cli, py: stub, profile: ascii }
     steps:
       - name: 型の確認と実行環境の記録
         id: gate
@@ -986,86 +986,94 @@ jobs:
           [System.IO.File]::WriteAllText((Join-Path $sl "activation.json"), $act, $utf8)
           [System.IO.File]::WriteAllText((Join-Path $sl "license.json"), $lic, $utf8)
 
-      - name: Claude Code の起動と同じく自動更新フックを動かす
+      - name: 動かし方ごとに更新を実行 (${{ matrix.method }})
         if: steps.gate.outputs.run == '1'
         id: hook
         shell: powershell
+        env:
+          SOLOPTILINK_EVICT_TRACE: "on"
         run: |
           $ErrorActionPreference = "Continue"
           $sl = Join-Path $env:USERPROFILE ".soloptilink"
+          $exe = Join-Path $sl "soloptilink.exe"
           $out = "$env:RUNNER_TEMP\out"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
-          # ── 型ごとに PATH を組み替える ──
-          $parts = @($env:PATH -split ';' | Where-Object { $_ -ne '' })
+          $env:HOME = $env:USERPROFILE
+          # 社員の PC に多い状態: 本物の Python は無く、python3 は実行すると失敗する身代わりだけがある
           if ("${{ matrix.py }}" -eq "stub") {
-            # 社員の PC に多い状態: 本物の Python は無く、python3 は実行すると失敗する身代わりだけがある
-            $parts = @($parts | Where-Object { $_ -notmatch '(?i)python|WindowsApps' })
-            $stub = "C:\pystub"
-            New-Item -ItemType Directory -Force -Path $stub | Out-Null
-            Copy-Item "$env:SystemRoot\System32\findstr.exe" "$stub\python3.exe" -Force
-            $parts = @($stub) + $parts
-            Write-Host "python3 is a failing stub (Store-alias-like); real Python removed from PATH"
+            $parts = @($env:PATH -split ';' | Where-Object { $_ -ne '' -and $_ -notmatch '(?i)python|WindowsApps' })
+            New-Item -ItemType Directory -Force -Path "C:\pystub" | Out-Null
+            Copy-Item "$env:SystemRoot\System32\findstr.exe" "C:\pystub\python3.exe" -Force
+            $env:PATH = ((@("C:\pystub") + $parts) -join ';')
+            Write-Host "python3 is a failing stub; real Python removed from PATH"
           }
-          if ("${{ matrix.route }}" -eq "nobash") {
-            # Git Bash が無い PC: bash の候補をすべて見えなくする (起動用プログラム自身の更新へ落ちる)
-            $parts = @($parts | Where-Object { $_ -notmatch '(?i)\\Git\\|msys64' })
-            foreach ($d in @("$env:ProgramFiles\Git", "C:\msys64")) {
-              if (Test-Path $d) { Rename-Item -Path $d -NewName ((Split-Path $d -Leaf) + "_hidden") -ErrorAction Continue }
-            }
-            foreach ($c in @("$env:ProgramFiles\Git\bin\bash.exe", "C:\msys64\usr\bin\bash.exe", "$env:SystemRoot\System32\bash.exe")) {
-              Write-Host ("bash candidate exists={0} {1}" -f (Test-Path $c), $c)
-            }
-          }
-          $env:PATH = ($parts -join ';')
-          # 24 時間の間隔の記録を消す (前回の確認から 1 日以上たった朝の起動と同じ状態)
+          # 1 日以上たった朝の起動と同じ状態にする
           Remove-Item (Join-Path $sl ".last_auto_update_check") -Force -ErrorAction SilentlyContinue
-          # 登録されている自動更新フックを settings.json から読む (自分で組み立てない)
-          $settings = Join-Path $env:USERPROFILE ".claude\settings.json"
-          $j = Get-Content -Raw -Encoding UTF8 $settings | ConvertFrom-Json
-          $found = @()
-          foreach ($ev in $j.hooks.PSObject.Properties) {
-            foreach ($m in @($ev.Value)) { foreach ($h in @($m.hooks)) {
-              if ("$($h.command)" -match 'hook-autoupdate') { $found += [pscustomobject]@{ ev = $ev.Name; cmd = "$($h.command)"; timeout = $h.timeout } }
-            } }
-          }
-          $found | Format-Table -AutoSize | Out-String | Write-Host
-          if ($found.Count -lt 1) { Write-Host "::error::auto-update hook is not registered in settings.json"; exit 1 }
-          $pick = ($found | Where-Object { $_.ev -eq "SessionStart" } | Select-Object -First 1)
-          if (-not $pick) { $pick = $found[0] }
-          $to = 30; if ($pick.timeout) { $to = [int]$pick.timeout }
-          $t0 = Get-Date
           $bashExe = "$env:ProgramFiles\Git\bin\bash.exe"
-          if (("${{ matrix.route }}" -eq "bash") -and (Test-Path $bashExe)) {
-            # Claude Code (Windows) は Git Bash でフックのコマンドを実行する
-            $p = Start-Process -FilePath $bashExe -ArgumentList @("-c", ('"' + ($pick.cmd -replace '"', '\"') + '"')) -PassThru -NoNewWindow -RedirectStandardOutput "$out\hook.out" -RedirectStandardError "$out\hook.err"
-          } else {
-            $p = Start-Process -FilePath "cmd.exe" -ArgumentList ('/d /s /c "' + $pick.cmd + '"') -PassThru -NoNewWindow -RedirectStandardOutput "$out\hook.out" -RedirectStandardError "$out\hook.err"
+          $method = "${{ matrix.method }}"
+          $t0 = Get-Date
+          function Wait-Or-Kill($p, [int]$sec, [string]$what) {
+            if (-not $p.WaitForExit($sec * 1000)) {
+              Write-Host "::warning::$what did not finish within ${sec}s - stopped"
+              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+              return $false
+            }
+            return $true
           }
-          if (-not $p.WaitForExit($to * 1000)) {
-            Write-Host "::warning::hook did not return within ${to}s - stopping it like Claude Code does"
-            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-            "hook_timeout=1" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          switch ($method) {
+            "hook" {
+              $settings = Join-Path $env:USERPROFILE ".claude\settings.json"
+              $j = Get-Content -Raw -Encoding UTF8 $settings | ConvertFrom-Json
+              $cmd = $null; $to = 30
+              foreach ($m in @($j.hooks.SessionStart)) { foreach ($h in @($m.hooks)) { if ((-not $cmd) -and ("$($h.command)" -match 'hook-autoupdate')) { $cmd = "$($h.command)"; if ($h.timeout) { $to = [int]$h.timeout } } } }
+              if (-not $cmd) { Write-Host "::error::SessionStart auto-update hook not registered"; exit 1 }
+              Write-Host "hook command: $cmd (timeout ${to}s)"
+              $p = Start-Process -FilePath $bashExe -ArgumentList @("-c", ('"' + ($cmd -replace '"', '\"') + '"')) -PassThru -NoNewWindow -RedirectStandardOutput "$out\run.out" -RedirectStandardError "$out\run.err"
+              [void](Wait-Or-Kill $p $to "hook")
+              $limit = 6
+            }
+            "worker-fg" {
+              # 背景の作業担当を前面で動かし、止まる場所を画面に出す
+              $env:SOLOPTILINK_DEBUG = "1"
+              $p = Start-Process -FilePath $exe -ArgumentList @("--hook-autoupdate-worker") -PassThru -NoNewWindow -RedirectStandardOutput "$out\run.out" -RedirectStandardError "$out\run.err"
+              [void](Wait-Or-Kill $p 480 "foreground worker")
+              $limit = 1
+            }
+            "update-cli" {
+              # チャットで「最新版にして」と伝えたときと同じ操作 (soloptilink-upgrade の手順そのもの)
+              $script = 'cd ~/.soloptilink && printf "y\n" | timeout 540 ./soloptilink --update'
+              $p = Start-Process -FilePath $bashExe -ArgumentList @("-c", ('"' + ($script -replace '"', '\"') + '"')) -PassThru -NoNewWindow -RedirectStandardOutput "$out\run.out" -RedirectStandardError "$out\run.err"
+              [void](Wait-Or-Kill $p 600 "--update")
+              $limit = 2
+            }
+            "force-bash" {
+              $script = 'bash ~/.soloptilink/auto-update.sh --force'
+              $p = Start-Process -FilePath $bashExe -ArgumentList @("-c", ('"' + ($script -replace '"', '\"') + '"')) -PassThru -NoNewWindow -RedirectStandardOutput "$out\run.out" -RedirectStandardError "$out\run.err"
+              [void](Wait-Or-Kill $p 600 "auto-update.sh --force")
+              $limit = 2
+            }
           }
           $sec = [int]((Get-Date) - $t0).TotalSeconds
-          Write-Host "hook returned after ${sec}s (event=$($pick.ev) timeout=${to}s)"
-          Write-Host "--- hook stdout ---"; Get-Content "$out\hook.out" -ErrorAction SilentlyContinue | Select-Object -First 20 | Write-Host
-          Write-Host "--- hook stderr ---"; Get-Content "$out\hook.err" -ErrorAction SilentlyContinue | Select-Object -First 20 | Write-Host
-          # ── 本体の版が切り替わるまで待つ (最大 15 分) ──
+          Write-Host "method=$method returned after ${sec}s"
+          Write-Host "--- stdout ---"; Get-Content "$out\run.out" -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -Last 40 | Write-Host
+          Write-Host "--- stderr ---"; Get-Content "$out\run.err" -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -Last 40 | Write-Host
+          # 本体の版が切り替わるまで待つ (背景で進む型のための猶予)
           $target = "v" + "${{ inputs.version }}".TrimStart("v")
-          $deadline = (Get-Date).AddMinutes(15)
+          $deadline = (Get-Date).AddMinutes($limit)
           do {
-            Start-Sleep -Seconds 10
             $v = (Get-Content (Join-Path $sl "VERSION") -ErrorAction SilentlyContinue | Select-Object -First 1)
             $st = (Get-Content (Join-Path $sl ".auto-update-status.json") -Raw -ErrorAction SilentlyContinue)
-            Write-Host ("{0} VERSION={1} status={2}" -f (Get-Date -Format HH:mm:ss), $v, ("$st".Trim()))
-          } until (("$v".Trim() -eq $target) -or ((Get-Date) -gt $deadline) -or ("$st" -match '"status":"(failed|error)"'))
+            $procs = @(Get-Process -Name "soloptilink" -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+            Write-Host ("{0} VERSION={1} launcher-procs=[{2}] status={3}" -f (Get-Date -Format HH:mm:ss), $v, ($procs -join ','), ("$st".Trim()))
+            if ("$v".Trim() -eq $target) { break }
+            Start-Sleep -Seconds 15
+          } until ((Get-Date) -gt $deadline)
           $elapsed = [int]((Get-Date) - $t0).TotalSeconds
           "version=$("$v".Trim())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "elapsed=$elapsed"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          # 見えなくした bash を元に戻す (この後の確認で使うため)
-          foreach ($d in @("$env:ProgramFiles\Git_hidden", "C:\msys64_hidden")) {
-            if (Test-Path $d) { Rename-Item -Path $d -NewName ((Split-Path $d -Leaf) -replace '_hidden$', '') -ErrorAction Continue }
-          }
+          Write-Host "--- mock.log ---"; Get-Content "$env:RUNNER_TEMP\mock\mock.log" -ErrorAction SilentlyContinue | Write-Host
+          Write-Host "--- launcher.log (tail) ---"; Get-Content (Join-Path $sl "logs\launcher.log") -Encoding UTF8 -Tail 30 -ErrorAction SilentlyContinue | Write-Host
+          Write-Host "--- auto-update.log (tail) ---"; Get-Content (Join-Path $sl ".auto-update.log") -Encoding UTF8 -Tail 30 -ErrorAction SilentlyContinue | Write-Host
 
       - name: 更新後の状態を独立に数える
         if: steps.gate.outputs.run == '1'
@@ -1132,6 +1140,8 @@ jobs:
             if (Test-Path $p) { Copy-Item $p (Join-Path $out ("sl" + $f)) -Force }
           }
           Copy-Item "$env:RUNNER_TEMP\mock\mock.log" "$out\mock.log" -Force -ErrorAction SilentlyContinue
+          if (Test-Path (Join-Path $sl "logs")) { Copy-Item (Join-Path $sl "logs") (Join-Path $out "sl-logs") -Recurse -Force -ErrorAction SilentlyContinue }
+          Get-ChildItem -Path $env:USERPROFILE -Recurse -Force -File -ErrorAction SilentlyContinue -Include "*evict-trace*", "*tombstone*" | Select-Object -First 20 | ForEach-Object { Write-Host "evict-trace: $($_.FullName) $($_.Length)"; Copy-Item $_.FullName (Join-Path $out ("evict-" + $_.Name)) -Force }
           Copy-Item "$env:RUNNER_TEMP\mock\mock.err" "$out\mock.err" -Force -ErrorAction SilentlyContinue
           Get-ChildItem -Path $sl -Filter "*.log" -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddHours(-2) } | ForEach-Object { Copy-Item $_.FullName (Join-Path $out ("sl-" + $_.Name)) -Force }
           Write-Host "--- auto-update.log (tail) ---"
