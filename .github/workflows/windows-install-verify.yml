@@ -1475,9 +1475,8 @@ jobs:
           	"bytes"
           	"fmt"
           	"os"
+          	"syscall"
           	"unsafe"
-
-          	"golang.org/x/sys/windows"
           )
 
           type dataBlob struct {
@@ -1502,10 +1501,10 @@ jobs:
           }
 
           var (
-          	modcrypt32    = windows.NewLazySystemDLL("crypt32.dll")
+          	modcrypt32    = syscall.NewLazyDLL("crypt32.dll")
           	procProtect   = modcrypt32.NewProc("CryptProtectData")
           	procUnprotect = modcrypt32.NewProc("CryptUnprotectData")
-          	modkernel32   = windows.NewLazySystemDLL("kernel32.dll")
+          	modkernel32   = syscall.NewLazyDLL("kernel32.dll")
           	procLocalFree = modkernel32.NewProc("LocalFree")
           )
 
@@ -1607,20 +1606,17 @@ jobs:
           # Keep the go directive low enough for the runner's own toolchain.
           # (The runner had go1.24.13; asking for 1.25.0 made go download a toolchain
           #  and its progress output on stderr was treated as a failure.)
+          # No external module is used (standard syscall only), so no require line.
           @"
           module kstest
 
           go 1.21
-
-          require golang.org/x/sys v0.44.0
           "@ | Set-Content "$work\go.mod" -Encoding ascii
           cd $work
           # Native commands write progress to stderr; send both streams to files so
           # PowerShell does not turn them into terminating errors.
           $env:GOTOOLCHAIN = "local"
           $env:GOFLAGS = "-mod=mod"
-          cmd /c "go mod tidy > `"$work\tidy.log`" 2>&1"
-          Get-Content "$work\tidy.log" -ErrorAction SilentlyContinue | Select-Object -Last 5 | Write-Host
           cmd /c "go build -o `"$work\kstest.exe`" . > `"$work\build.log`" 2>&1"
           Get-Content "$work\build.log" -ErrorAction SilentlyContinue | Select-Object -Last 10 | Write-Host
           if (-not (Test-Path "$work\kstest.exe")) { Write-Host "::error::could not build the test program"; exit 1 }
