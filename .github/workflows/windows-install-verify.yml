@@ -50,6 +50,31 @@ on:
         options:
           - public
           - draft
+      # ★2026-10-04 追加: 前の版からの自動更新を Windows で実走する。
+      #   既存の 3 ジョブは「新規導入」しか試しておらず、すでに使っている端末が
+      #   自動更新で次の版へ上がる流れ (社員・お客様の大半が通る経路) は Windows で一度も
+      #   走っていなかった。更新確認の窓口は試験用の窓口 (127.0.0.1・https) に差し替え、
+      #   本番から写し取った応答をそのまま返す。配布物の取得と署名の確認は本物の経路で行う。
+      from_version:
+        description: "更新元の版 (例: 2056.8)。指定すると前の版からの自動更新を試す"
+        required: false
+        default: ""
+        type: string
+      pilot_response_b64:
+        description: "先行配信の更新確認の応答 (本番から写した JSON を base64)。空なら先行配信の型は省く"
+        required: false
+        default: ""
+        type: string
+      stable_response_b64:
+        description: "全体配信時の更新確認の応答 (base64)。空なら全体配信の型は省く"
+        required: false
+        default: ""
+        type: string
+      arm64:
+        description: "ARM 版 Windows (windows-11-arm) で x64 版 ZIP の新規導入を試す"
+        required: false
+        default: false
+        type: boolean
 
 # ★2026-09-29: 公開前に Windows 実機で確かめられるよう、下書き (未公開) のリリースからも取れるようにした。
 #   従来は「公開 → 実証 → 登録」の順でしか回らず、Windows で確かめないまま公開物がお客様の目に
@@ -772,5 +797,438 @@ jobs:
         with:
           name: windows-bat-entry-log-${{ inputs.version }}
           path: ${{ runner.temp }}/install-bat.log
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ── 前の版からの自動更新 (2026-10-04 追加) ─────────────────────────────────
+  #   【なぜ要るか】
+  #     社員・お客様の端末の大半は「新規導入」ではなく「自動更新」で次の版へ上がる。
+  #     ところが Windows で自動更新を実走した記録は 1 件も無かった (新規導入の 3 ジョブだけ)。
+  #     Windows のフックは "<exe>" --hook-autoupdate で、Git Bash があれば auto-update.sh に任せ、
+  #     版が動かなければ 3 秒後に起動用プログラム自身の更新 (経路B) へ落ちる。
+  #     社員の PC には python3 が Store へ誘導するだけの身代わりしか無いことが多く、
+  #     その場合の挙動は runner (本物の Python 入り) では再現しない。ここで型を分けて実走する。
+  #   【測り方】
+  #     ① 前の版の Windows ZIP を公開リリースから取り、そのまま導入する (-NoActivate)
+  #     ② 更新確認の窓口だけを試験用の窓口 (https://127.0.0.1:8766) に差し替え、本番から写した応答を返す
+  #        配布物 (raw の tar.gz)・署名 (.sig)・起動用プログラム (リリースの .exe) は本物の経路から取る
+  #     ③ settings.json に登録された自動更新フックを、Claude Code と同じく時間制限つきで起動する
+  #     ④ 本体の版・スキルの中身・起動用プログラム・自己診断を独立に数える
+  #   ★まずは報告のみ (continue-on-error)。
+  update-from-previous:
+    name: "前の版からの自動更新 (${{ matrix.id }})"
+    if: ${{ inputs.from_version != '' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: "1-pilot-gitbash-realpy",   os: windows-latest, resp: pilot,  route: bash,   py: real, profile: ascii }
+          - { id: "2-pilot-gitbash-pystub",   os: windows-latest, resp: pilot,  route: bash,   py: stub, profile: ascii }
+          - { id: "3-pilot-nobash",           os: windows-latest, resp: pilot,  route: nobash, py: stub, profile: ascii }
+          - { id: "4-pilot-jpuser-pystub",    os: windows-latest, resp: pilot,  route: bash,   py: stub, profile: japanese }
+          - { id: "5-pilot-server2022-pystub", os: windows-2022,  resp: pilot,  route: bash,   py: stub, profile: ascii }
+          - { id: "6-full-gitbash-pystub",    os: windows-latest, resp: stable, route: bash,   py: stub, profile: ascii }
+          - { id: "7-full-nobash",            os: windows-latest, resp: stable, route: nobash, py: stub, profile: ascii }
+    steps:
+      - name: 型の確認と実行環境の記録
+        id: gate
+        shell: powershell
+        env:
+          RESP_B64: ${{ matrix.resp == 'stable' && inputs.stable_response_b64 || inputs.pilot_response_b64 }}
+        run: |
+          $ErrorActionPreference = "Continue"
+          if ([string]::IsNullOrWhiteSpace($env:RESP_B64)) {
+            Write-Host "No response given for type '${{ matrix.resp }}' - this case is skipped (NOT a pass)."
+            "run=0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 0
+          }
+          $os = [System.Environment]::OSVersion.VersionString
+          Write-Host "case=${{ matrix.id }} OS=$os PS=$($PSVersionTable.PSVersion) arch=$env:PROCESSOR_ARCHITECTURE"
+          foreach ($p in @("$env:ProgramFiles\Git\usr\bin\setsid.exe", "$env:ProgramFiles\Git\usr\bin\perl.exe", "$env:SystemRoot\System32\bash.exe", "C:\msys64\usr\bin\bash.exe", "$env:LOCALAPPDATA\Microsoft\WindowsApps\python3.exe")) {
+            Write-Host ("exists={0} {1}" -f (Test-Path $p), $p)
+          }
+          "run=1" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: ユーザーのフォルダ名を日本語と空白にする (型 4 のみ)
+        if: steps.gate.outputs.run == '1' && matrix.profile == 'japanese'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          # 文字コードの影響を受けないよう文字番号で組み立てる (yamada taro / 間に空白)
+          $jp = -join ([char[]](0x5C71, 0x7530, 0x0020, 0x592A, 0x90CE))
+          $p = Join-Path "C:\Users" $jp
+          New-Item -ItemType Directory -Force -Path $p | Out-Null
+          "USERPROFILE=$p" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "USERPROFILE is redirected to a folder with Japanese characters and a space"
+
+      - name: 前の版を公開リリースから取得して導入
+        if: steps.gate.outputs.run == '1'
+        id: prev
+        shell: powershell
+        env:
+          SOLOPTILINK_NO_END_PAUSE: "1"
+        run: |
+          $ErrorActionPreference = "Continue"
+          $from = "${{ inputs.from_version }}".TrimStart("v")
+          $url = "https://github.com/${{ github.repository }}/releases/download/v$from/SoloptiLinkAI_v${from}_Windows.zip"
+          $zip = "$env:RUNNER_TEMP\from.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          $dst = "$env:RUNNER_TEMP\frompkg"
+          Expand-Archive -Path $zip -DestinationPath $dst -Force
+          $ps1 = Get-ChildItem -Path $dst -Recurse -Filter "soloptilink-install.ps1" -File | Select-Object -First 1
+          if (-not $ps1) { Write-Host "::error::installer of v$from not found"; exit 1 }
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\out" | Out-Null
+          & $ps1.FullName -NoActivate 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\out\install-prev.log" | Select-Object -Last 15
+          $sl = Join-Path $env:USERPROFILE ".soloptilink"
+          $v = (Get-Content (Join-Path $sl "VERSION") -ErrorAction SilentlyContinue | Select-Object -First 1)
+          Write-Host "installed body: $v (at $sl)"
+          if ("$v".Trim() -ne "v$from") { Write-Host "::error::previous version was not installed (VERSION=$v)"; exit 1 }
+          $exe = Join-Path $sl "soloptilink.exe"
+          $h0 = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          Write-Host "launcher before update: $h0"
+          "exe_before=$h0" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: 更新先の版の中身を控える (比較用)
+        if: steps.gate.outputs.run == '1'
+        id: target
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ver = "${{ inputs.version }}".TrimStart("v")
+          $url = "https://github.com/${{ github.repository }}/releases/download/v$ver/SoloptiLinkAI_v${ver}_Windows.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\target.zip" -UseBasicParsing
+          Expand-Archive -Path "$env:RUNNER_TEMP\target.zip" -DestinationPath "$env:RUNNER_TEMP\targetpkg" -Force
+          $boost = Get-ChildItem -Path "$env:RUNNER_TEMP\targetpkg" -Recurse -Filter "SKILL.md" -File | Where-Object { $_.Directory.Name -eq "soloptilink-boost" } | Select-Object -First 1
+          $bh = (Get-FileHash $boost.FullName -Algorithm SHA256).Hash.ToLower()
+          $exeUrl = "https://github.com/${{ github.repository }}/releases/download/v$ver/soloptilink-windows-amd64.exe.sha256"
+          Invoke-WebRequest -Uri $exeUrl -OutFile "$env:RUNNER_TEMP\target-exe.sha256" -UseBasicParsing
+          $eh = ((Get-Content -Raw "$env:RUNNER_TEMP\target-exe.sha256") -split '\s+')[0].Trim().ToLower()
+          Write-Host "target boost SKILL.md: $bh / target launcher: $eh"
+          "boost=$bh" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "exe=$eh"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: 試験用の更新確認の窓口を起動 (https://127.0.0.1:8766)
+        if: steps.gate.outputs.run == '1'
+        shell: powershell
+        env:
+          RESP_B64: ${{ matrix.resp == 'stable' && inputs.stable_response_b64 || inputs.pilot_response_b64 }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $ver = "${{ inputs.version }}".TrimStart("v")
+          $work = "$env:RUNNER_TEMP\mock"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $ossl = @("$env:ProgramFiles\Git\mingw64\bin\openssl.exe", "$env:ProgramFiles\Git\usr\bin\openssl.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $ossl) { Write-Host "::error::openssl not found"; exit 1 }
+          $ErrorActionPreference = "Continue"
+          & $ossl req -x509 -newkey rsa:2048 -nodes -keyout "$work\key.pem" -out "$work\cert.pem" -days 2 -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" 2>&1 | Out-Host
+          & $ossl x509 -in "$work\cert.pem" -outform der -out "$work\cert.cer" 2>&1 | Out-Host
+          $ErrorActionPreference = "Stop"
+          # 起動用プログラム (Go) と schannel は Windows の信頼済みルートを使う。試験用の証明書をそこへ入れる。
+          Import-Certificate -FilePath "$work\cert.cer" -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+          # Git Bash の curl (OpenSSL) は CA の束を読む。既定の束に試験用の証明書を足したものを渡す。
+          $bundle = "$env:ProgramFiles\Git\mingw64\etc\ssl\certs\ca-bundle.crt"
+          Get-Content $bundle, "$work\cert.pem" | Set-Content -Encoding ascii "$work\bundle.pem"
+          $raw = [System.Convert]::FromBase64String($env:RESP_B64)
+          foreach ($a in @("amd64", "arm64")) { [System.IO.File]::WriteAllBytes("$work\fix-windows-$a.json", $raw) }
+          $mock = @'
+          import http.server, sys, urllib.parse, datetime, os, ssl
+          FIX, LOG = sys.argv[2], sys.argv[3]
+          class H(http.server.BaseHTTPRequestHandler):
+              def _log(self, code):
+                  with open(LOG, "a") as f:
+                      f.write("%s %s %s -> %s dev_hdr=%s\n" % (datetime.datetime.now().strftime("%H:%M:%S"), self.command, self.path, code, bool(self.headers.get("X-Soloptilink-Device-Id"))))
+              def _send(self, code, body=b""):
+                  self.send_response(code); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body); self._log(code)
+              def do_GET(self):
+                  p = urllib.parse.urlparse(self.path); q = urllib.parse.parse_qs(p.query)
+                  o = q.get("os", ["windows"])[0]; a = q.get("arch", ["amd64"])[0]
+                  if p.path.endswith("/updates/check"):
+                      fn = "%s-%s-%s.json" % (FIX, o, a)
+                      if not os.path.exists(fn): fn = "%s-windows-amd64.json" % FIX
+                      return self._send(200, open(fn, "rb").read())
+                  if p.path.endswith("/updates/download"):
+                      loc = "%s/soloptilink-%s-%s%s" % (os.environ["REDIRECT_BASE"], o, a, ".exe" if o == "windows" else "")
+                      self.send_response(302); self.send_header("Location", loc); self.send_header("Content-Length", "0"); self.end_headers(); self._log(302); return
+                  return self._send(404, b'{"error":"not found (mock)"}')
+              def do_POST(self):
+                  n = int(self.headers.get("Content-Length") or 0); self.rfile.read(n)
+                  return self._send(404, b'{"error":"not found (mock)"}')
+              def log_message(self, *a): pass
+          srv = http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H)
+          ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER); ctx.load_cert_chain(sys.argv[4], sys.argv[5])
+          srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+          srv.serve_forever()
+          '@
+          [System.IO.File]::WriteAllText("$work\mock.py", $mock, (New-Object System.Text.UTF8Encoding($false)))
+          $py = (Get-Command python -ErrorAction Stop).Source
+          $env:REDIRECT_BASE = "https://github.com/${{ github.repository }}/releases/download/v$ver"
+          Start-Process -FilePath $py -ArgumentList @("$work\mock.py", "8766", "$work\fix", "$work\mock.log", "$work\cert.pem", "$work\key.pem") -WindowStyle Hidden -RedirectStandardError "$work\mock.err"
+          Start-Sleep -Seconds 3
+          $r = Invoke-WebRequest -Uri "https://127.0.0.1:8766/api/v1/updates/check?version=probe&os=windows&arch=amd64" -UseBasicParsing
+          Write-Host "mock probe: HTTP $($r.StatusCode) $($r.Content.Substring(0, [Math]::Min(160, $r.Content.Length)))"
+          "SOLOPTILINK_API_URL=https://127.0.0.1:8766/api/v1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "CURL_CA_BUNDLE=$work\bundle.pem"                  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 承認済みの端末と同じ記録を置く
+        if: steps.gate.outputs.run == '1'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sl = Join-Path $env:USERPROFILE ".soloptilink"
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          $exp = (Get-Date).ToUniversalTime().AddDays(30).ToString("yyyy-MM-ddTHH:mm:ssZ")
+          $act = '{"email":"ci@example.test","company_code":"CI0001","device_id":"dev_ci0001","fingerprint":"fp-v2-ci","hardware_uuid":"00000000-0000-0000-0000-000000000000","activated_at":"2026-09-01T00:00:00Z","server_key_half":"Y2k="}'
+          $lic = '{"token":"tok_ci","device_id":"dev_ci0001","company_id":"","company_code":"CI0001","status":"approved","issued_at":"2026-09-01T00:00:00Z","expires_at":"' + $exp + '","signature":""}'
+          [System.IO.File]::WriteAllText((Join-Path $sl "activation.json"), $act, $utf8)
+          [System.IO.File]::WriteAllText((Join-Path $sl "license.json"), $lic, $utf8)
+
+      - name: Claude Code の起動と同じく自動更新フックを動かす
+        if: steps.gate.outputs.run == '1'
+        id: hook
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $sl = Join-Path $env:USERPROFILE ".soloptilink"
+          $out = "$env:RUNNER_TEMP\out"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          # ── 型ごとに PATH を組み替える ──
+          $parts = @($env:PATH -split ';' | Where-Object { $_ -ne '' })
+          if ("${{ matrix.py }}" -eq "stub") {
+            # 社員の PC に多い状態: 本物の Python は無く、python3 は実行すると失敗する身代わりだけがある
+            $parts = @($parts | Where-Object { $_ -notmatch '(?i)python|WindowsApps' })
+            $stub = "C:\pystub"
+            New-Item -ItemType Directory -Force -Path $stub | Out-Null
+            Copy-Item "$env:SystemRoot\System32\findstr.exe" "$stub\python3.exe" -Force
+            $parts = @($stub) + $parts
+            Write-Host "python3 is a failing stub (Store-alias-like); real Python removed from PATH"
+          }
+          if ("${{ matrix.route }}" -eq "nobash") {
+            # Git Bash が無い PC: bash の候補をすべて見えなくする (起動用プログラム自身の更新へ落ちる)
+            $parts = @($parts | Where-Object { $_ -notmatch '(?i)\\Git\\|msys64' })
+            foreach ($d in @("$env:ProgramFiles\Git", "C:\msys64")) {
+              if (Test-Path $d) { Rename-Item -Path $d -NewName ((Split-Path $d -Leaf) + "_hidden") -ErrorAction Continue }
+            }
+            foreach ($c in @("$env:ProgramFiles\Git\bin\bash.exe", "C:\msys64\usr\bin\bash.exe", "$env:SystemRoot\System32\bash.exe")) {
+              Write-Host ("bash candidate exists={0} {1}" -f (Test-Path $c), $c)
+            }
+          }
+          $env:PATH = ($parts -join ';')
+          # 24 時間の間隔の記録を消す (前回の確認から 1 日以上たった朝の起動と同じ状態)
+          Remove-Item (Join-Path $sl ".last_auto_update_check") -Force -ErrorAction SilentlyContinue
+          # 登録されている自動更新フックを settings.json から読む (自分で組み立てない)
+          $settings = Join-Path $env:USERPROFILE ".claude\settings.json"
+          $j = Get-Content -Raw -Encoding UTF8 $settings | ConvertFrom-Json
+          $found = @()
+          foreach ($ev in $j.hooks.PSObject.Properties) {
+            foreach ($m in @($ev.Value)) { foreach ($h in @($m.hooks)) {
+              if ("$($h.command)" -match 'hook-autoupdate') { $found += [pscustomobject]@{ ev = $ev.Name; cmd = "$($h.command)"; timeout = $h.timeout } }
+            } }
+          }
+          $found | Format-Table -AutoSize | Out-String | Write-Host
+          if ($found.Count -lt 1) { Write-Host "::error::auto-update hook is not registered in settings.json"; exit 1 }
+          $pick = ($found | Where-Object { $_.ev -eq "SessionStart" } | Select-Object -First 1)
+          if (-not $pick) { $pick = $found[0] }
+          $to = 30; if ($pick.timeout) { $to = [int]$pick.timeout }
+          $t0 = Get-Date
+          $bashExe = "$env:ProgramFiles\Git\bin\bash.exe"
+          if (("${{ matrix.route }}" -eq "bash") -and (Test-Path $bashExe)) {
+            # Claude Code (Windows) は Git Bash でフックのコマンドを実行する
+            $p = Start-Process -FilePath $bashExe -ArgumentList @("-c", ('"' + ($pick.cmd -replace '"', '\"') + '"')) -PassThru -NoNewWindow -RedirectStandardOutput "$out\hook.out" -RedirectStandardError "$out\hook.err"
+          } else {
+            $p = Start-Process -FilePath "cmd.exe" -ArgumentList ('/d /s /c "' + $pick.cmd + '"') -PassThru -NoNewWindow -RedirectStandardOutput "$out\hook.out" -RedirectStandardError "$out\hook.err"
+          }
+          if (-not $p.WaitForExit($to * 1000)) {
+            Write-Host "::warning::hook did not return within ${to}s - stopping it like Claude Code does"
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            "hook_timeout=1" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
+          $sec = [int]((Get-Date) - $t0).TotalSeconds
+          Write-Host "hook returned after ${sec}s (event=$($pick.ev) timeout=${to}s)"
+          Write-Host "--- hook stdout ---"; Get-Content "$out\hook.out" -ErrorAction SilentlyContinue | Select-Object -First 20 | Write-Host
+          Write-Host "--- hook stderr ---"; Get-Content "$out\hook.err" -ErrorAction SilentlyContinue | Select-Object -First 20 | Write-Host
+          # ── 本体の版が切り替わるまで待つ (最大 15 分) ──
+          $target = "v" + "${{ inputs.version }}".TrimStart("v")
+          $deadline = (Get-Date).AddMinutes(15)
+          do {
+            Start-Sleep -Seconds 10
+            $v = (Get-Content (Join-Path $sl "VERSION") -ErrorAction SilentlyContinue | Select-Object -First 1)
+            $st = (Get-Content (Join-Path $sl ".auto-update-status.json") -Raw -ErrorAction SilentlyContinue)
+            Write-Host ("{0} VERSION={1} status={2}" -f (Get-Date -Format HH:mm:ss), $v, ("$st".Trim()))
+          } until (("$v".Trim() -eq $target) -or ((Get-Date) -gt $deadline) -or ("$st" -match '"status":"(failed|error)"'))
+          $elapsed = [int]((Get-Date) - $t0).TotalSeconds
+          "version=$("$v".Trim())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "elapsed=$elapsed"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          # 見えなくした bash を元に戻す (この後の確認で使うため)
+          foreach ($d in @("$env:ProgramFiles\Git_hidden", "C:\msys64_hidden")) {
+            if (Test-Path $d) { Rename-Item -Path $d -NewName ((Split-Path $d -Leaf) -replace '_hidden$', '') -ErrorAction Continue }
+          }
+
+      - name: 更新後の状態を独立に数える
+        if: steps.gate.outputs.run == '1'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $sl = Join-Path $env:USERPROFILE ".soloptilink"
+          $target = "v" + "${{ inputs.version }}".TrimStart("v")
+          $ok = $true
+          $v = "${{ steps.hook.outputs.version }}"
+          Write-Host "body VERSION after hook: $v (expected $target) in ${{ steps.hook.outputs.elapsed }}s"
+          if ($v -ne $target) { Write-Host "::error::body was NOT updated to $target"; $ok = $false }
+          $boost = Join-Path $env:USERPROFILE ".claude\skills\soloptilink-boost\SKILL.md"
+          $bh = ""; if (Test-Path $boost) { $bh = (Get-FileHash $boost -Algorithm SHA256).Hash.ToLower() }
+          Write-Host "skill soloptilink-boost: $bh (target ${{ steps.target.outputs.boost }})"
+          if ($bh -ne "${{ steps.target.outputs.boost }}") { Write-Host "::error::the skill the user types was NOT replaced with the target version"; $ok = $false }
+          $exe = Join-Path $sl "soloptilink.exe"
+          $eh = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          Write-Host "launcher: before=${{ steps.prev.outputs.exe_before }} after=$eh target=${{ steps.target.outputs.exe }}"
+          if ("${{ matrix.resp }}" -eq "stable") {
+            if ($eh -ne "${{ steps.target.outputs.exe }}") { Write-Host "::error::launcher was NOT replaced with the target version (full-release type)"; $ok = $false }
+          } else {
+            if ($eh -ne "${{ steps.prev.outputs.exe_before }}") { Write-Host "::warning::launcher changed in the pilot type (pilot ships the body only)" }
+          }
+          $vo = (& $exe --version 2>&1 | Out-String).Trim()
+          Write-Host "launcher --version: $vo"
+          if ([string]::IsNullOrWhiteSpace($vo)) { Write-Host "::error::launcher does not run after the update"; $ok = $false }
+          if (-not $ok) { exit 1 }
+
+      - name: 更新後に出荷物自身の自己診断を実行
+        if: steps.gate.outputs.run == '1'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $sl = Join-Path $env:USERPROFILE ".soloptilink"
+          $bash = "$env:ProgramFiles\Git\bin\bash.exe"
+          $sc = Join-Path $sl "installer\self-check.sh"
+          if (-not (Test-Path $sc)) { Write-Host "::error::self-check.sh not present after the update"; exit 1 }
+          $env:HOME = $env:USERPROFILE
+          & $bash $sc json > "$env:RUNNER_TEMP\out\selfcheck.json" 2> "$env:RUNNER_TEMP\out\selfcheck.err"
+          $raw = Get-Content -Raw "$env:RUNNER_TEMP\out\selfcheck.json" -ErrorAction SilentlyContinue
+          try { $d = $raw | ConvertFrom-Json } catch { Write-Host "::error::self-check produced no readable verdict"; exit 1 }
+          $skip = @("device_activation", "mcp_registration", "devtools")
+          $fail = 0
+          foreach ($it in $d.checks) {
+            $vv = ("$($it.verdict)").ToUpper()
+            Write-Host ("{0,-14} {1,-22} {2}" -f $vv, $it.id, $it.reason_ja)
+            if ($skip -contains "$($it.id)") { continue }
+            if ($vv -eq "FAIL") { $fail++ }
+          }
+          Write-Host "self-check failures (excluding environment-limited items): $fail"
+          if ($fail -gt 0) { exit 1 }
+
+      - name: 記録を集める
+        if: always() && steps.gate.outputs.run == '1'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $sl = Join-Path $env:USERPROFILE ".soloptilink"
+          $out = "$env:RUNNER_TEMP\out"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          foreach ($f in @(".auto-update.log", ".auto-update-status.json", ".error-log", ".pkgapply-fail-count", "VERSION")) {
+            $p = Join-Path $sl $f
+            if (Test-Path $p) { Copy-Item $p (Join-Path $out ("sl" + $f)) -Force }
+          }
+          Copy-Item "$env:RUNNER_TEMP\mock\mock.log" "$out\mock.log" -Force -ErrorAction SilentlyContinue
+          Copy-Item "$env:RUNNER_TEMP\mock\mock.err" "$out\mock.err" -Force -ErrorAction SilentlyContinue
+          Get-ChildItem -Path $sl -Filter "*.log" -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -gt (Get-Date).AddHours(-2) } | ForEach-Object { Copy-Item $_.FullName (Join-Path $out ("sl-" + $_.Name)) -Force }
+          Write-Host "--- auto-update.log (tail) ---"
+          Get-Content (Join-Path $sl ".auto-update.log") -Tail 40 -ErrorAction SilentlyContinue | Write-Host
+          Write-Host "--- mock.log ---"
+          Get-Content "$out\mock.log" -ErrorAction SilentlyContinue | Write-Host
+
+      - name: 記録を保存
+        if: always() && steps.gate.outputs.run == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-update-${{ matrix.id }}-${{ inputs.version }}
+          path: ${{ runner.temp }}/out
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ── ARM 版 Windows (2026-10-04 追加) ────────────────────────────────────────
+  #   ARM 版の ZIP は作っていない (申告済み)。ARM 版の PC のお客様は x64 版の ZIP を使う。
+  #   x64 版が ARM 版 Windows の上で (エミュレーションで) 導入・起動できるかを実走する。
+  arm64-fresh-install:
+    name: ARM 版 Windows で x64 版 ZIP を新規導入 (windows-11-arm)
+    if: ${{ inputs.arm64 }}
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - name: 実行環境を記録
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "OS=$([System.Environment]::OSVersion.VersionString) PS=$($PSVersionTable.PSVersion) Edition=$($PSVersionTable.PSEdition)"
+          Write-Host "PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE"
+          foreach ($p in @("$env:ProgramFiles\Git\bin\bash.exe", "$env:ProgramFiles\nodejs\node.exe")) { Write-Host ("exists={0} {1}" -f (Test-Path $p), $p) }
+
+      - name: 配布物を取得して導入 (x64 版 ZIP)
+        shell: powershell
+        env:
+          SOLOPTILINK_NO_END_PAUSE: "1"
+        run: |
+          $ErrorActionPreference = "Continue"
+          $ver = "${{ inputs.version }}".TrimStart("v")
+          $url = "https://github.com/${{ github.repository }}/releases/download/v$ver/SoloptiLinkAI_v${ver}_Windows.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\win.zip" -UseBasicParsing
+          Expand-Archive -Path "$env:RUNNER_TEMP\win.zip" -DestinationPath "$env:RUNNER_TEMP\pkg" -Force
+          $ps1 = Get-ChildItem -Path "$env:RUNNER_TEMP\pkg" -Recurse -Filter "soloptilink-install.ps1" -File | Select-Object -First 1
+          New-Item -ItemType Directory -Force -Path "$env:RUNNER_TEMP\out" | Out-Null
+          & $ps1.FullName -NoActivate 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\out\install-arm64.log" | Select-Object -Last 25
+
+      - name: 置かれた物と起動を確かめる
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $ok = $true
+          $sl = Join-Path $env:USERPROFILE ".soloptilink"
+          $detail = Get-ChildItem -Path "$env:USERPROFILE" -Filter "setup_detail.txt" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($detail) {
+            $line = Select-String -Path $detail.FullName -Pattern "installer-failure" -SimpleMatch | Select-Object -First 1
+            if ($line) { Write-Host "::error::install halted on ARM64: $($line.Line.Trim())"; $ok = $false }
+          }
+          $v = (Get-Content (Join-Path $sl "VERSION") -ErrorAction SilentlyContinue | Select-Object -First 1)
+          Write-Host "VERSION=$v"
+          $n = 0; $skills = Join-Path $env:USERPROFILE ".claude\skills"
+          if (Test-Path $skills) { $n = (Get-ChildItem -Path $skills -Directory).Count }
+          Write-Host "skill dirs: $n"
+          if ($n -lt 1) { Write-Host "::error::no skills placed on ARM64"; $ok = $false }
+          $settings = Join-Path $env:USERPROFILE ".claude\settings.json"
+          $hook = 0; if ((Test-Path $settings) -and ((Get-Content -Raw $settings) -match "hook-autoupdate")) { $hook = 1 }
+          Write-Host "auto-update hook: $hook"
+          if ($hook -ne 1) { Write-Host "::error::auto-update hook not registered on ARM64"; $ok = $false }
+          $exe = Join-Path $sl "soloptilink.exe"
+          if (Test-Path $exe) {
+            $vo = (& $exe --version 2>&1 | Out-String).Trim()
+            Write-Host "launcher (x64 under emulation) --version: $vo / exit=$LASTEXITCODE"
+            if ([string]::IsNullOrWhiteSpace($vo)) { Write-Host "::error::x64 launcher produced no output on ARM64"; $ok = $false }
+          } else { Write-Host "::error::launcher not placed"; $ok = $false }
+          $bash = "$env:ProgramFiles\Git\bin\bash.exe"
+          if (Test-Path $bash) {
+            $env:HOME = $env:USERPROFILE
+            & $bash (Join-Path $sl "installer\self-check.sh") json > "$env:RUNNER_TEMP\out\selfcheck.json" 2> "$env:RUNNER_TEMP\out\selfcheck.err"
+            try {
+              $d = Get-Content -Raw "$env:RUNNER_TEMP\out\selfcheck.json" | ConvertFrom-Json
+              $fail = 0
+              foreach ($it in $d.checks) {
+                Write-Host ("{0,-14} {1,-22} {2}" -f $it.verdict, $it.id, $it.reason_ja)
+                if ((@("device_activation", "mcp_registration", "devtools") -notcontains "$($it.id)") -and ("$($it.verdict)".ToUpper() -eq "FAIL")) { $fail++ }
+              }
+              Write-Host "self-check failures (excluding environment-limited items): $fail"
+              if ($fail -gt 0) { $ok = $false }
+            } catch { Write-Host "::error::self-check verdict unreadable on ARM64"; $ok = $false }
+          } else { Write-Host "::warning::Git Bash not present on this runner - self-check NOT measured" }
+          if (-not $ok) { exit 1 }
+
+      - name: 記録を保存
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-arm64-${{ inputs.version }}
+          path: ${{ runner.temp }}/out
           retention-days: 30
           if-no-files-found: warn
