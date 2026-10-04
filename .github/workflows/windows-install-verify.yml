@@ -1453,15 +1453,19 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
+          # 日本語が化けないように出力の文字コードを UTF-8 に固定する
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $OutputEncoding = [System.Text.Encoding]::UTF8
           Write-Host "OS=$([System.Environment]::OSVersion.VersionString) PS=$($PSVersionTable.PSVersion)"
           Write-Host "whoami=$(whoami)"
-          $go = (Get-Command go -ErrorAction SilentlyContinue)
-          Write-Host ("go: {0}" -f ($(if ($go) { (& go version) } else { "(無し)" })))
+          $go = Get-Command go -ErrorAction SilentlyContinue
+          if ($go) { & go version } else { Write-Host "go is not installed" }
 
       - name: 試験用プログラムを用意する
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           $work = "$env:RUNNER_TEMP\ks"
           New-Item -ItemType Directory -Force -Path $work | Out-Null
           $src = @'
@@ -1617,6 +1621,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           $work = "$env:RUNNER_TEMP\ks"
           $shared = "C:\kstest"
           New-Item -ItemType Directory -Force -Path $shared | Out-Null
@@ -1630,6 +1635,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           $shared = "C:\kstest"
           # 別の利用者を作り、その利用者としてだけ復号を試す
           $name = "kstestuser"
