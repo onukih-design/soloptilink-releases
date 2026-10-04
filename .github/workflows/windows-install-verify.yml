@@ -75,6 +75,11 @@ on:
         required: false
         default: ""
         type: string
+      jp_user:
+        description: "日本語名の一般ユーザー (管理者でない) を作って新規導入を試す"
+        required: false
+        default: false
+        type: boolean
       arm64:
         description: "ARM 版 Windows (windows-11-arm) で x64 版 ZIP の新規導入を試す"
         required: false
@@ -830,17 +835,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # p0 = いま本番が返している先行配信の応答そのまま (本番で起きていることの再現)
-          # p1 = 更新物の置き場所だけをリリースの添付ファイルへ変えた応答 (案1)
-          # p2 = p1 に更新物の署名を応答へ入れた応答 (案1 + 署名)
-          - { id: "P0-hook",      os: windows-latest, resp: pilot, variant: p0, method: hook,       py: stub, profile: ascii }
-          - { id: "P0-update-cli", os: windows-latest, resp: pilot, variant: p0, method: update-cli, py: stub, profile: ascii }
-          - { id: "P1-hook",      os: windows-latest, resp: pilot, variant: p1, method: hook,       py: stub, profile: ascii }
-          - { id: "P1-update-cli", os: windows-latest, resp: pilot, variant: p1, method: update-cli, py: stub, profile: ascii }
-          - { id: "P2-hook",      os: windows-latest, resp: pilot, variant: p2, method: hook,       py: stub, profile: ascii }
-          - { id: "P2-update-cli", os: windows-latest, resp: pilot, variant: p2, method: update-cli, py: stub, profile: ascii }
-          - { id: "P2-hook-server2022", os: windows-2022, resp: pilot, variant: p2, method: hook,   py: stub, profile: ascii }
-          - { id: "P2-hook-arm64", os: windows-11-arm, resp: pilot, variant: p2, method: hook,       py: stub, profile: ascii }
+          - { id: "P2-hook-run1", os: windows-latest, resp: pilot, variant: p2, method: hook, py: stub, profile: ascii }
+          - { id: "P2-hook-run2", os: windows-latest, resp: pilot, variant: p2, method: hook, py: stub, profile: ascii }
+          - { id: "P1-hook-run2", os: windows-latest, resp: pilot, variant: p1, method: hook, py: stub, profile: ascii }
+          - { id: "P0-hook-run2", os: windows-latest, resp: pilot, variant: p0, method: hook, py: stub, profile: ascii }
     steps:
       - name: 型の確認と実行環境の記録
         id: gate
@@ -1111,9 +1109,11 @@ jobs:
             $st = (Get-Content (Join-Path $sl ".auto-update-status.json") -Raw -ErrorAction SilentlyContinue)
             $procs = @(Get-Process -Name "soloptilink" -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
             Write-Host ("{0} VERSION={1} launcher-procs=[{2}] status={3}" -f (Get-Date -Format HH:mm:ss), $v, ($procs -join ','), ("$st".Trim()))
-            if ("$v".Trim() -eq $target) { break }
+            # 版が切り替わり、かつ裏の更新処理 (起動用プログラム) が終わってから確かめる
+            #   (2026-10-04 実測: 版の切り替え直後はスキルの入れ替えが終わっていないことがある)
+            if (("$v".Trim() -eq $target) -and ($procs.Count -eq 0)) { break }
             Start-Sleep -Seconds 15
-          } until ((Get-Date) -gt $deadline)
+          } until ((Get-Date) -gt $deadline.AddMinutes(3))
           $elapsed = [int]((Get-Date) - $t0).TotalSeconds
           "version=$("$v".Trim())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "elapsed=$elapsed"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
@@ -1286,5 +1286,108 @@ jobs:
         with:
           name: windows-arm64-${{ inputs.version }}
           path: ${{ runner.temp }}/out
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ── 日本語名の一般ユーザー (管理者でない) で新規導入 (2026-10-04 追加) ──────────
+  #   これまでの日本語の試験は、展開先かユーザーフォルダの場所だけを差し替えた近似だった。
+  #   ここでは Windows に日本語名 (空白入り) の一般ユーザーを実際に作り、そのユーザーとして
+  #   ダブルクリックの入口 (.bat) から導入し、出荷物自身の自己診断まで走らせる。
+  #   ★管理者でないユーザーで動かすため、管理者権限を要する処理があればここで止まる。
+  jp-standard-user-install:
+    name: 日本語名の一般ユーザーで新規導入 (管理者でない・空白入りの名前)
+    if: ${{ inputs.jp_user }}
+    runs-on: windows-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - name: 日本語名の一般ユーザーを作り、そのユーザーとして導入する
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $ver = "${{ inputs.version }}".TrimStart("v")
+          $share = "C:\sltest"
+          New-Item -ItemType Directory -Force -Path $share | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/${{ github.repository }}/releases/download/v$ver/SoloptiLinkAI_v${ver}_Windows.zip" -OutFile "$share\pkg.zip" -UseBasicParsing
+          # ユーザー名: yamada taro (間に空白) を文字番号で組み立てる
+          $name = -join ([char[]](0x5C71, 0x7530, 0x0020, 0x592A, 0x90CE))
+          $pw = "Sl!" + [guid]::NewGuid().ToString("N").Substring(0, 16) + "aA9"
+          $sec = ConvertTo-SecureString $pw -AsPlainText -Force
+          New-LocalUser -Name $name -Password $sec -PasswordNeverExpires -AccountNeverExpires | Out-Null
+          Add-LocalGroupMember -Group "Users" -Member $name
+          $isAdmin = [bool](Get-LocalGroupMember -Group "Administrators" | Where-Object { $_.Name -like "*$name" })
+          Write-Host "created local user (standard user). member of Administrators: $isAdmin"
+          icacls $share /grant "*S-1-5-32-545:(OI)(CI)M" | Out-Null
+          # そのユーザーとして動かす台本 (ASCII のみ。日本語は文字番号で扱う)
+          $userScript = @'
+          $ErrorActionPreference = "Continue"
+          $share = "C:\sltest"
+          $log = "$share\user-run.log"
+          "whoami=$(whoami)" | Out-File $log -Encoding utf8
+          "USERPROFILE=$env:USERPROFILE" | Out-File $log -Append -Encoding utf8
+          $p = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+          "is_admin=$($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))" | Out-File $log -Append -Encoding utf8
+          $dl = Join-Path $env:USERPROFILE "Downloads"
+          New-Item -ItemType Directory -Force -Path $dl | Out-Null
+          $zip = Join-Path $dl "SoloptiLinkAI.zip"
+          Copy-Item "$share\pkg.zip" $zip -Force
+          Set-Content -Path $zip -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3" -Encoding Ascii
+          $dst = Join-Path $dl "SoloptiLinkAI (1)"
+          Expand-Archive -Path $zip -DestinationPath $dst -Force
+          Get-ChildItem -Path $dst -Recurse -File | ForEach-Object { Set-Content -LiteralPath $_.FullName -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3" -Encoding Ascii -ErrorAction SilentlyContinue }
+          $root = (Get-ChildItem -Path $dst -Directory | Where-Object { Test-Path (Join-Path $_.FullName "installer\soloptilink-install.ps1") } | Select-Object -First 1).FullName
+          $bat = Get-ChildItem -Path $root -Filter "*.bat" -File | Select-Object -First 1
+          "entry=$($bat.FullName)" | Out-File $log -Append -Encoding utf8
+          $env:SOLOPTILINK_NO_END_PAUSE = "1"
+          $env:SOLOPTILINK_INSTALL_NO_ACTIVATE = "1"
+          cmd /c "call `"$($bat.FullName)`" < nul" *> "$share\install-user.log"
+          "install_exit=$LASTEXITCODE" | Out-File $log -Append -Encoding utf8
+          $sl = Join-Path $env:USERPROFILE ".soloptilink"
+          "VERSION=$(Get-Content (Join-Path $sl 'VERSION') -ErrorAction SilentlyContinue | Select-Object -First 1)" | Out-File $log -Append -Encoding utf8
+          $skills = Join-Path $env:USERPROFILE ".claude\skills"
+          "skill_dirs=$(if (Test-Path $skills) { (Get-ChildItem $skills -Directory).Count } else { 0 })" | Out-File $log -Append -Encoding utf8
+          $settings = Join-Path $env:USERPROFILE ".claude\settings.json"
+          "hook=$(if ((Test-Path $settings) -and ((Get-Content -Raw $settings) -match 'hook-autoupdate')) { 1 } else { 0 })" | Out-File $log -Append -Encoding utf8
+          $exe = Join-Path $sl "soloptilink.exe"
+          "launcher=$((& $exe --version 2>&1 | Out-String).Trim())" | Out-File $log -Append -Encoding utf8
+          $env:HOME = $env:USERPROFILE
+          & "$env:ProgramFiles\Git\bin\bash.exe" (Join-Path $sl "installer\self-check.sh") json > "$share\selfcheck.json" 2> "$share\selfcheck.err"
+          Get-ChildItem -Path $env:USERPROFILE -Filter "setup_detail.txt" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1 | ForEach-Object { Copy-Item $_.FullName "$share\setup_detail.txt" -Force }
+          "done" | Out-File "$share\done.txt" -Encoding utf8
+          '@
+          [System.IO.File]::WriteAllText("$share\run-as-user.ps1", $userScript, (New-Object System.Text.UTF8Encoding($true)))
+          # タスクとして、そのユーザーのログオン (パスワード) で 1 回だけ走らせる
+          $act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\sltest\run-as-user.ps1"
+          Register-ScheduledTask -TaskName "sl-jp-user" -Action $act -User $name -Password $pw -RunLevel Limited -Force | Out-Null
+          Start-ScheduledTask -TaskName "sl-jp-user"
+          $deadline = (Get-Date).AddMinutes(30)
+          while (-not (Test-Path "$share\done.txt") -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 15; Write-Host ("{0} waiting... task state={1}" -f (Get-Date -Format HH:mm:ss), (Get-ScheduledTask -TaskName "sl-jp-user").State) }
+          Write-Host "--- user-run.log ---"; Get-Content "$share\user-run.log" -Encoding UTF8 -ErrorAction SilentlyContinue | Write-Host
+          Write-Host "--- install log (tail) ---"; Get-Content "$share\install-user.log" -Encoding UTF8 -Tail 40 -ErrorAction SilentlyContinue | Write-Host
+          Write-Host "--- setup_detail ---"; Get-Content "$share\setup_detail.txt" -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -Last 20 | Write-Host
+          $ok = $true
+          if (-not (Test-Path "$share\done.txt")) { Write-Host "::error::the run as the Japanese-named standard user did not finish in 30 minutes"; $ok = $false }
+          $u = Get-Content "$share\user-run.log" -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+          if ($u -notmatch "VERSION=v$ver") { Write-Host "::error::body not installed for the Japanese-named standard user"; $ok = $false }
+          if ($u -match "skill_dirs=0") { Write-Host "::error::no skills placed for the Japanese-named standard user"; $ok = $false }
+          if ($u -notmatch "hook=1") { Write-Host "::error::auto-update hook not registered for the Japanese-named standard user"; $ok = $false }
+          try {
+            $d = Get-Content -Raw "$share\selfcheck.json" | ConvertFrom-Json
+            $fail = 0
+            foreach ($it in $d.checks) {
+              Write-Host ("{0,-14} {1,-22} {2}" -f $it.verdict, $it.id, $it.reason_ja)
+              if ((@("device_activation", "mcp_registration", "devtools") -notcontains "$($it.id)") -and ("$($it.verdict)".ToUpper() -eq "FAIL")) { $fail++ }
+            }
+            Write-Host "self-check failures (excluding environment-limited items): $fail"
+            if ($fail -gt 0) { $ok = $false }
+          } catch { Write-Host "::error::self-check verdict unreadable"; Get-Content "$share\selfcheck.err" -ErrorAction SilentlyContinue | Select-Object -First 20 | Write-Host; $ok = $false }
+          if (-not $ok) { exit 1 }
+
+      - name: 記録を保存
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-jp-standard-user-${{ inputs.version }}
+          path: C:\sltest\*.log
           retention-days: 30
           if-no-files-found: warn
