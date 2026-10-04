@@ -70,6 +70,11 @@ on:
         required: false
         default: ""
         type: string
+      nocreds_response_b64:
+        description: "資格を付けない問い合わせへの本番の応答 (base64)。指定すると試験用の窓口が本番と同じく資格の有無で応答を分ける"
+        required: false
+        default: ""
+        type: string
       arm64:
         description: "ARM 版 Windows (windows-11-arm) で x64 版 ZIP の新規導入を試す"
         required: false
@@ -825,13 +830,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { id: "A-pilot-hook",          os: windows-latest, resp: pilot,  method: hook,       py: stub, profile: ascii }
-          - { id: "B-pilot-worker-fg",     os: windows-latest, resp: pilot,  method: worker-fg,  py: stub, profile: ascii }
-          - { id: "C-pilot-update-cli",    os: windows-latest, resp: pilot,  method: update-cli, py: stub, profile: ascii }
-          - { id: "D-pilot-force-bash",    os: windows-latest, resp: pilot,  method: force-bash, py: stub, profile: ascii }
-          - { id: "E-pilot-update-cli-jp", os: windows-latest, resp: pilot,  method: update-cli, py: stub, profile: japanese }
-          - { id: "F-full-hook",           os: windows-latest, resp: stable, method: hook,       py: stub, profile: ascii }
-          - { id: "G-full-update-cli",     os: windows-latest, resp: stable, method: update-cli, py: stub, profile: ascii }
+          # p0 = いま本番が返している先行配信の応答そのまま (本番で起きていることの再現)
+          # p1 = 更新物の置き場所だけをリリースの添付ファイルへ変えた応答 (案1)
+          # p2 = p1 に更新物の署名を応答へ入れた応答 (案1 + 署名)
+          - { id: "P0-hook",      os: windows-latest, resp: pilot, variant: p0, method: hook,       py: stub, profile: ascii }
+          - { id: "P0-update-cli", os: windows-latest, resp: pilot, variant: p0, method: update-cli, py: stub, profile: ascii }
+          - { id: "P1-hook",      os: windows-latest, resp: pilot, variant: p1, method: hook,       py: stub, profile: ascii }
+          - { id: "P1-update-cli", os: windows-latest, resp: pilot, variant: p1, method: update-cli, py: stub, profile: ascii }
+          - { id: "P2-hook",      os: windows-latest, resp: pilot, variant: p2, method: hook,       py: stub, profile: ascii }
+          - { id: "P2-update-cli", os: windows-latest, resp: pilot, variant: p2, method: update-cli, py: stub, profile: ascii }
+          - { id: "P2-hook-server2022", os: windows-2022, resp: pilot, variant: p2, method: hook,   py: stub, profile: ascii }
+          - { id: "P2-hook-arm64", os: windows-11-arm, resp: pilot, variant: p2, method: hook,       py: stub, profile: ascii }
     steps:
       - name: 型の確認と実行環境の記録
         id: gate
@@ -915,13 +924,14 @@ jobs:
         shell: powershell
         env:
           RESP_B64: ${{ matrix.resp == 'stable' && inputs.stable_response_b64 || inputs.pilot_response_b64 }}
+          NOCREDS_B64: ${{ inputs.nocreds_response_b64 }}
         run: |
           $ErrorActionPreference = "Stop"
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           $ver = "${{ inputs.version }}".TrimStart("v")
           $work = "$env:RUNNER_TEMP\mock"
           New-Item -ItemType Directory -Force -Path $work | Out-Null
-          $ossl = @("$env:ProgramFiles\Git\mingw64\bin\openssl.exe", "$env:ProgramFiles\Git\usr\bin\openssl.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          $ossl = @("$env:ProgramFiles\Git\mingw64\bin\openssl.exe", "$env:ProgramFiles\Git\clangarm64\bin\openssl.exe", "$env:ProgramFiles\Git\usr\bin\openssl.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $ossl) { Write-Host "::error::openssl not found"; exit 1 }
           $ErrorActionPreference = "Continue"
           & $ossl req -x509 -newkey rsa:2048 -nodes -keyout "$work\key.pem" -out "$work\cert.pem" -days 2 -subj "/CN=127.0.0.1" -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" 2>&1 | Out-Host
@@ -930,10 +940,26 @@ jobs:
           # 起動用プログラム (Go) と schannel は Windows の信頼済みルートを使う。試験用の証明書をそこへ入れる。
           Import-Certificate -FilePath "$work\cert.cer" -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
           # Git Bash の curl (OpenSSL) は CA の束を読む。既定の束に試験用の証明書を足したものを渡す。
-          $bundle = "$env:ProgramFiles\Git\mingw64\etc\ssl\certs\ca-bundle.crt"
+          # Git の CA の束 (x64 は mingw64・ARM64 は clangarm64・どちらにも usr\ssl がある)
+          $bundle = @("$env:ProgramFiles\Git\mingw64\etc\ssl\certs\ca-bundle.crt", "$env:ProgramFiles\Git\clangarm64\etc\ssl\certs\ca-bundle.crt", "$env:ProgramFiles\Git\usr\ssl\certs\ca-bundle.crt") | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $bundle) { Write-Host "::error::CA bundle of Git not found"; exit 1 }
           Get-Content $bundle, "$work\cert.pem" | Set-Content -Encoding ascii "$work\bundle.pem"
           $raw = [System.Convert]::FromBase64String($env:RESP_B64)
-          foreach ($a in @("amd64", "arm64")) { [System.IO.File]::WriteAllBytes("$work\fix-windows-$a.json", $raw) }
+          [System.IO.File]::WriteAllBytes("$work\resp-base.json", $raw)
+          if (-not [string]::IsNullOrWhiteSpace($env:NOCREDS_B64)) {
+            [System.IO.File]::WriteAllBytes("$work\nocreds-windows-amd64.json", [System.Convert]::FromBase64String($env:NOCREDS_B64))
+            [System.IO.File]::WriteAllBytes("$work\nocreds-windows-arm64.json", [System.Convert]::FromBase64String($env:NOCREDS_B64))
+          }
+          $variant = "${{ matrix.variant }}"
+          $relBase = "https://github.com/${{ github.repository }}/releases/download/v$ver"
+          $sigB64 = ""
+          if ($variant -eq "p2") {
+            Invoke-WebRequest -Uri "$relBase/soloptilink-update-v$ver.tar.gz.sig.b64" -OutFile "$work\pkg.sig.b64" -UseBasicParsing
+            $sigB64 = (Get-Content -Raw "$work\pkg.sig.b64").Trim()
+          }
+          $env:SL_VARIANT = $variant; $env:SL_RELPKG = "$relBase/soloptilink-update-v$ver.tar.gz"; $env:SL_SIG = $sigB64; $env:SL_WORK = $work
+          $py0 = (Get-Command python -ErrorAction Stop).Source
+          & $py0 -c "import json,os; w=os.environ['SL_WORK']; d=json.load(open(w+'/resp-base.json',encoding='utf-8')); v=os.environ['SL_VARIANT']; d.update({'package_url': os.environ['SL_RELPKG']}) if v in ('p1','p2') else None; d.update({'package_signature': os.environ['SL_SIG']}) if v=='p2' else None; [json.dump(d, open(w+'/fix-windows-%s.json' % a,'w',encoding='utf-8'), ensure_ascii=False) for a in ('amd64','arm64')]; print('variant', v, 'package_url', d.get('package_url'), 'sig', bool(d.get('package_signature')))"
           $mock = @'
           import http.server, sys, urllib.parse, datetime, os, ssl
           FIX, LOG = sys.argv[2], sys.argv[3]
@@ -946,10 +972,18 @@ jobs:
               def do_GET(self):
                   p = urllib.parse.urlparse(self.path); q = urllib.parse.parse_qs(p.query)
                   o = q.get("os", ["windows"])[0]; a = q.get("arch", ["amd64"])[0]
+                  has_creds = bool(self.headers.get("X-Soloptilink-Device-Id"))
                   if p.path.endswith("/updates/check"):
+                      # 本番と同じく、資格の無い問い合わせには一般向けの応答を返す (用意があれば)
+                      nc = os.path.join(os.path.dirname(FIX), "nocreds-%s-%s.json" % (o, a))
+                      if (not has_creds) and os.path.exists(nc):
+                          return self._send(200, open(nc, "rb").read())
                       fn = "%s-%s-%s.json" % (FIX, o, a)
                       if not os.path.exists(fn): fn = "%s-windows-amd64.json" % FIX
                       return self._send(200, open(fn, "rb").read())
+                  if p.path.endswith("/updates/download") and q.get("proxy", [""])[0] == "1" and os.environ.get("STABLE_PKG_URL"):
+                      # 本番の取得口は一般向けの更新物を返す (先行配信の端末にも)
+                      self.send_response(302); self.send_header("Location", os.environ["STABLE_PKG_URL"]); self.send_header("Content-Length", "0"); self.end_headers(); self._log(302); return
                   if p.path.endswith("/updates/download"):
                       loc = "%s/soloptilink-%s-%s%s" % (os.environ["REDIRECT_BASE"], o, a, ".exe" if o == "windows" else "")
                       self.send_response(302); self.send_header("Location", loc); self.send_header("Content-Length", "0"); self.end_headers(); self._log(302); return
@@ -1001,6 +1035,11 @@ jobs:
           $ver = "${{ inputs.version }}".TrimStart("v")
           $work = "$env:RUNNER_TEMP\mock"
           $env:REDIRECT_BASE = "https://github.com/${{ github.repository }}/releases/download/v$ver"
+          if ("${{ matrix.resp }}" -eq "pilot") {
+            $from = "${{ inputs.from_version }}".TrimStart("v")
+            $env:REDIRECT_BASE = "https://github.com/${{ github.repository }}/releases/download/v$from"
+            $env:STABLE_PKG_URL = "https://raw.githubusercontent.com/${{ github.repository }}/main/packages/soloptilink-update-v$from.tar.gz"
+          }
           Start-Process -FilePath $env:MOCK_PY -ArgumentList @("$work\mock.py", "8766", "$work\fix", "$work\mock.log", "$work\cert.pem", "$work\key.pem") -WindowStyle Hidden -RedirectStandardError "$work\mock.err"
           Start-Sleep -Seconds 3
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
