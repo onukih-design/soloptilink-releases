@@ -1318,6 +1318,19 @@ jobs:
           $isAdmin = [bool](Get-LocalGroupMember -Group "Administrators" | Where-Object { $_.Name -like "*$name" })
           Write-Host "created local user (standard user). member of Administrators: $isAdmin"
           icacls $share /grant "*S-1-5-32-545:(OI)(CI)M" | Out-Null
+          # 予約したタスクとしてログオンする権利 (SeBatchLogonRight) を、この試験用のユーザーにだけ与える
+          #   (一般ユーザーには既定で無く、無いとタスクが一度も始まらない。2026-10-04 実測)
+          $sid = (Get-LocalUser -Name $name).SID.Value
+          secedit /export /cfg "$share\sec.inf" /areas USER_RIGHTS | Out-Null
+          $inf = Get-Content "$share\sec.inf" -Encoding Unicode
+          if ($inf -match '^SeBatchLogonRight') {
+            $inf = $inf | ForEach-Object { if ($_ -match '^SeBatchLogonRight') { "$_,*$sid" } else { $_ } }
+          } else {
+            $inf = $inf | ForEach-Object { $_; if ($_ -match '^\[Privilege Rights\]') { "SeBatchLogonRight = *$sid" } }
+          }
+          $inf | Set-Content "$share\sec.inf" -Encoding Unicode
+          secedit /configure /db "$share\sec.sdb" /cfg "$share\sec.inf" /areas USER_RIGHTS | Out-Null
+          Write-Host "granted SeBatchLogonRight to the test user only (exit=$LASTEXITCODE)"
           # そのユーザーとして動かす台本 (ASCII のみ。日本語は文字番号で扱う)
           $userScript = @'
           $ErrorActionPreference = "Continue"
@@ -1361,7 +1374,17 @@ jobs:
           Register-ScheduledTask -TaskName "sl-jp-user" -Action $act -User $name -Password $pw -RunLevel Limited -Force | Out-Null
           Start-ScheduledTask -TaskName "sl-jp-user"
           $deadline = (Get-Date).AddMinutes(30)
-          while (-not (Test-Path "$share\done.txt") -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 15; Write-Host ("{0} waiting... task state={1}" -f (Get-Date -Format HH:mm:ss), (Get-ScheduledTask -TaskName "sl-jp-user").State) }
+          while (-not (Test-Path "$share\done.txt") -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 20
+            $ti = Get-ScheduledTaskInfo -TaskName "sl-jp-user"
+            $st = (Get-ScheduledTask -TaskName "sl-jp-user").State
+            Write-Host ("{0} task state={1} last-result=0x{2:X} started={3}" -f (Get-Date -Format HH:mm:ss), $st, $ti.LastTaskResult, (Test-Path "$share\user-run.log"))
+            # 一度も始まらずに失敗したら、待たずに止める (権利・ログオンの失敗)
+            if (($st -eq "Ready") -and ($ti.LastRunTime -gt (Get-Date).AddYears(-1)) -and -not (Test-Path "$share\user-run.log") -and ($ti.LastTaskResult -ne 0) -and ($ti.LastTaskResult -ne 267009) -and ($ti.LastTaskResult -ne 267011)) {
+              Write-Host "::error::the task as the test user could not start (last result 0x$('{0:X}' -f $ti.LastTaskResult)) - harness problem, not a product result"
+              break
+            }
+          }
           Write-Host "--- user-run.log ---"; Get-Content "$share\user-run.log" -Encoding UTF8 -ErrorAction SilentlyContinue | Write-Host
           Write-Host "--- install log (tail) ---"; Get-Content "$share\install-user.log" -Encoding UTF8 -Tail 40 -ErrorAction SilentlyContinue | Write-Host
           Write-Host "--- setup_detail ---"; Get-Content "$share\setup_detail.txt" -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -Last 20 | Write-Host
