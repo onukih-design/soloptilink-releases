@@ -965,11 +965,9 @@ jobs:
           '@
           [System.IO.File]::WriteAllText("$work\mock.py", $mock, (New-Object System.Text.UTF8Encoding($false)))
           $py = (Get-Command python -ErrorAction Stop).Source
-          $env:REDIRECT_BASE = "https://github.com/${{ github.repository }}/releases/download/v$ver"
-          Start-Process -FilePath $py -ArgumentList @("$work\mock.py", "8766", "$work\fix", "$work\mock.log", "$work\cert.pem", "$work\key.pem") -WindowStyle Hidden -RedirectStandardError "$work\mock.err"
-          Start-Sleep -Seconds 3
-          $r = Invoke-WebRequest -Uri "https://127.0.0.1:8766/api/v1/updates/check?version=probe&os=windows&arch=amd64" -UseBasicParsing
-          Write-Host "mock probe: HTTP $($r.StatusCode) $($r.Content.Substring(0, [Math]::Min(160, $r.Content.Length)))"
+          "MOCK_PY=$py" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # ★窓口はここでは起動しない。Windows の runner は手順の切れ目で子プロセスを止めるため、
+          #   更新を実行する手順の中で起動する (2026-10-04 実測: 前の手順で起動した窓口は次の手順で接続拒否)。
           "SOLOPTILINK_API_URL=https://127.0.0.1:8766/api/v1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "CURL_CA_BUNDLE=$work\bundle.pem"                  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
@@ -999,6 +997,15 @@ jobs:
           $out = "$env:RUNNER_TEMP\out"
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           $env:HOME = $env:USERPROFILE
+          # 試験用の窓口をこの手順の中で起動する (手順をまたぐと runner に止められる)
+          $ver = "${{ inputs.version }}".TrimStart("v")
+          $work = "$env:RUNNER_TEMP\mock"
+          $env:REDIRECT_BASE = "https://github.com/${{ github.repository }}/releases/download/v$ver"
+          Start-Process -FilePath $env:MOCK_PY -ArgumentList @("$work\mock.py", "8766", "$work\fix", "$work\mock.log", "$work\cert.pem", "$work\key.pem") -WindowStyle Hidden -RedirectStandardError "$work\mock.err"
+          Start-Sleep -Seconds 3
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          $r = Invoke-WebRequest -Uri "https://127.0.0.1:8766/api/v1/updates/check?version=probe&os=windows&arch=amd64" -UseBasicParsing
+          Write-Host "mock is up in this step: HTTP $($r.StatusCode)"
           # 社員の PC に多い状態: 本物の Python は無く、python3 は実行すると失敗する身代わりだけがある
           if ("${{ matrix.py }}" -eq "stub") {
             $parts = @($env:PATH -split ';' | Where-Object { $_ -ne '' -and $_ -notmatch '(?i)python|WindowsApps' })
