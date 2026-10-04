@@ -835,10 +835,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { id: "P2-hook-run1", os: windows-latest, resp: pilot, variant: p2, method: hook, py: stub, profile: ascii }
-          - { id: "P2-hook-run2", os: windows-latest, resp: pilot, variant: p2, method: hook, py: stub, profile: ascii }
-          - { id: "P1-hook-run2", os: windows-latest, resp: pilot, variant: p1, method: hook, py: stub, profile: ascii }
-          - { id: "P0-hook-run2", os: windows-latest, resp: pilot, variant: p0, method: hook, py: stub, profile: ascii }
+          # resp=pilot  … 先行配信の応答 (pilot_response_b64) を本番から写して渡す。資格の無い問い合わせには
+          #                nocreds_response_b64 を返し、取得口 (proxy=1) は前の版 (全社向け) の配布物を返す (本番と同じ)
+          # resp=stable … 全体配信時の応答 (stable_response_b64)。取得口は更新先の版の配布物を返す
+          # 渡されていない型は「省いた」と記録して合格にはしない
+          - { id: "pilot-hook",            os: windows-latest, resp: pilot,  variant: asis, method: hook,       py: stub, profile: ascii }
+          - { id: "pilot-update-cli",      os: windows-latest, resp: pilot,  variant: asis, method: update-cli, py: stub, profile: ascii }
+          - { id: "pilot-hook-server2022", os: windows-2022,   resp: pilot,  variant: asis, method: hook,       py: stub, profile: ascii }
+          - { id: "pilot-hook-arm64",      os: windows-11-arm, resp: pilot,  variant: asis, method: hook,       py: stub, profile: ascii }
+          - { id: "stable-hook",           os: windows-latest, resp: stable, variant: asis, method: hook,       py: stub, profile: ascii }
+          - { id: "stable-update-cli",     os: windows-latest, resp: stable, variant: asis, method: update-cli, py: stub, profile: ascii }
     steps:
       - name: 型の確認と実行環境の記録
         id: gate
@@ -944,7 +950,7 @@ jobs:
           Get-Content $bundle, "$work\cert.pem" | Set-Content -Encoding ascii "$work\bundle.pem"
           $raw = [System.Convert]::FromBase64String($env:RESP_B64)
           [System.IO.File]::WriteAllBytes("$work\resp-base.json", $raw)
-          if (-not [string]::IsNullOrWhiteSpace($env:NOCREDS_B64)) {
+          if (("${{ matrix.resp }}" -eq "pilot") -and (-not [string]::IsNullOrWhiteSpace($env:NOCREDS_B64))) {
             [System.IO.File]::WriteAllBytes("$work\nocreds-windows-amd64.json", [System.Convert]::FromBase64String($env:NOCREDS_B64))
             [System.IO.File]::WriteAllBytes("$work\nocreds-windows-arm64.json", [System.Convert]::FromBase64String($env:NOCREDS_B64))
           }
@@ -1034,9 +1040,13 @@ jobs:
           $work = "$env:RUNNER_TEMP\mock"
           $env:REDIRECT_BASE = "https://github.com/${{ github.repository }}/releases/download/v$ver"
           if ("${{ matrix.resp }}" -eq "pilot") {
+            # 先行配信: 一般向けは前の版のまま。起動用プログラムと取得口は前の版の物を返す
             $from = "${{ inputs.from_version }}".TrimStart("v")
             $env:REDIRECT_BASE = "https://github.com/${{ github.repository }}/releases/download/v$from"
             $env:STABLE_PKG_URL = "https://raw.githubusercontent.com/${{ github.repository }}/main/packages/soloptilink-update-v$from.tar.gz"
+          } else {
+            # 全体配信: 取得口は更新先の版の配布物を返す (登録後の本番と同じ)
+            $env:STABLE_PKG_URL = "https://raw.githubusercontent.com/${{ github.repository }}/main/packages/soloptilink-update-v$ver.tar.gz"
           }
           Start-Process -FilePath $env:MOCK_PY -ArgumentList @("$work\mock.py", "8766", "$work\fix", "$work\mock.log", "$work\cert.pem", "$work\key.pem") -WindowStyle Hidden -RedirectStandardError "$work\mock.err"
           Start-Sleep -Seconds 3
