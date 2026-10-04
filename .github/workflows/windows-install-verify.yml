@@ -75,6 +75,11 @@ on:
         required: false
         default: ""
         type: string
+      keystore:
+        description: "鍵の保管庫 (利用者アカウントに紐づく暗号化) が Windows で使えるかを実機で確かめる"
+        required: false
+        default: false
+        type: boolean
       jp_user:
         description: "日本語名の一般ユーザー (管理者でない) を作って新規導入を試す"
         required: false
@@ -1422,5 +1427,263 @@ jobs:
         with:
           name: windows-jp-standard-user-${{ inputs.version }}
           path: C:\sltest\*.log
+          retention-days: 30
+          if-no-files-found: warn
+
+  # ── 鍵の保管庫が Windows で使えるか (2026-10-05 追加) ─────────────────────────
+  #   【なぜ要るか】
+  #     お客様の端末では、配布物を開く鍵を「利用者アカウントに紐づく暗号化」
+  #     (DPAPI) で守る。これが実機で動かないと、鍵が守られないまま配ることになる。
+  #     Mac のキーチェーンは実機で確認済みだが、Windows は未確認だった。
+  #   【測ること】
+  #     ① 暗号化できる ② 結果に元の値がそのまま残らない ③ 復号して元に戻る
+  #     ④ 書き換えた物は復号できない (改ざんを検知する)
+  #     ⑤ 別の利用者では復号できない (持ち出しただけでは開けないことの実証)
+  #   【含めていないもの】
+  #     この手順にあるのは Windows 標準の暗号化の呼び出し方だけで、
+  #     製品側の鍵の構成や配布物の仕組みは含まない。
+  keystore-windows:
+    name: 鍵の保管庫が Windows で使えるか (利用者アカウントに紐づく暗号化)
+    if: ${{ inputs.keystore }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - name: 実行環境を記録
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "OS=$([System.Environment]::OSVersion.VersionString) PS=$($PSVersionTable.PSVersion)"
+          Write-Host "whoami=$(whoami)"
+          $go = (Get-Command go -ErrorAction SilentlyContinue)
+          Write-Host ("go: {0}" -f ($(if ($go) { (& go version) } else { "(無し)" })))
+
+      - name: 試験用プログラムを用意する
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $work = "$env:RUNNER_TEMP\ks"
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $src = @'
+          package main
+
+          import (
+          	"bytes"
+          	"fmt"
+          	"os"
+          	"unsafe"
+
+          	"golang.org/x/sys/windows"
+          )
+
+          type dataBlob struct {
+          	cbData uint32
+          	pbData *byte
+          }
+
+          func newBlob(b []byte) dataBlob {
+          	if len(b) == 0 {
+          		return dataBlob{}
+          	}
+          	return dataBlob{cbData: uint32(len(b)), pbData: &b[0]}
+          }
+
+          func (b *dataBlob) bytes() []byte {
+          	if b.pbData == nil || b.cbData == 0 {
+          		return nil
+          	}
+          	out := make([]byte, b.cbData)
+          	copy(out, unsafe.Slice(b.pbData, b.cbData))
+          	return out
+          }
+
+          var (
+          	modcrypt32    = windows.NewLazySystemDLL("crypt32.dll")
+          	procProtect   = modcrypt32.NewProc("CryptProtectData")
+          	procUnprotect = modcrypt32.NewProc("CryptUnprotectData")
+          	modkernel32   = windows.NewLazySystemDLL("kernel32.dll")
+          	procLocalFree = modkernel32.NewProc("LocalFree")
+          )
+
+          const uiForbidden = 0x1
+
+          func protect(plain []byte) ([]byte, error) {
+          	in := newBlob(plain)
+          	var out dataBlob
+          	r, _, err := procProtect.Call(uintptr(unsafe.Pointer(&in)), 0, 0, 0, 0, uiForbidden, uintptr(unsafe.Pointer(&out)))
+          	if r == 0 {
+          		return nil, err
+          	}
+          	defer procLocalFree.Call(uintptr(unsafe.Pointer(out.pbData)))
+          	return out.bytes(), nil
+          }
+
+          func unprotect(enc []byte) ([]byte, error) {
+          	in := newBlob(enc)
+          	var out dataBlob
+          	r, _, err := procUnprotect.Call(uintptr(unsafe.Pointer(&in)), 0, 0, 0, 0, uiForbidden, uintptr(unsafe.Pointer(&out)))
+          	if r == 0 {
+          		return nil, err
+          	}
+          	defer procLocalFree.Call(uintptr(unsafe.Pointer(out.pbData)))
+          	return out.bytes(), nil
+          }
+
+          func main() {
+          	if len(os.Args) > 2 && os.Args[1] == "unprotect-file" {
+          		enc, err := os.ReadFile(os.Args[2])
+          		if err != nil {
+          			fmt.Println("READ_ERROR", err)
+          			os.Exit(2)
+          		}
+          		if v, err := unprotect(enc); err != nil {
+          			fmt.Println("CANNOT_DECRYPT", err)
+          			os.Exit(3)
+          		} else {
+          			fmt.Printf("DECRYPTED %x\n", v)
+          			os.Exit(0)
+          		}
+          	}
+
+          	want := []byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00}
+          	fail := 0
+
+          	enc, err := protect(want)
+          	if err != nil {
+          		fmt.Println("NG 暗号化に失敗:", err)
+          		os.Exit(1)
+          	}
+          	fmt.Printf("OK 暗号化できた (%d バイト -> %d バイト)\n", len(want), len(enc))
+
+          	if bytes.Contains(enc, want) {
+          		fmt.Println("NG 暗号化した結果に元の値がそのまま含まれている")
+          		fail++
+          	} else {
+          		fmt.Println("OK 暗号化した結果に元の値は含まれていない")
+          	}
+
+          	got, err := unprotect(enc)
+          	if err != nil {
+          		fmt.Println("NG 復号に失敗:", err)
+          		fail++
+          	} else if !bytes.Equal(got, want) {
+          		fmt.Printf("NG 復号した値が違う: 入=%x 出=%x\n", want, got)
+          		fail++
+          	} else {
+          		fmt.Println("OK 復号して元の値に戻った")
+          	}
+
+          	broken := append([]byte{}, enc...)
+          	broken[len(broken)/2] ^= 0xff
+          	if _, err := unprotect(broken); err == nil {
+          		fmt.Println("NG 書き換えた物を復号できてしまった (改ざんを検知していない)")
+          		fail++
+          	} else {
+          		fmt.Println("OK 書き換えた物は復号できない (改ざんを検知する)")
+          	}
+
+          	if len(os.Args) > 2 && os.Args[1] == "protect-to" {
+          		if err := os.WriteFile(os.Args[2], enc, 0600); err != nil {
+          			fmt.Println("NG 書き出しに失敗:", err)
+          			fail++
+          		} else {
+          			fmt.Println("OK 暗号化した物を書き出した (別の利用者で試すため)")
+          		}
+          	}
+
+          	if fail > 0 {
+          		fmt.Printf("結果: 不合格 %d 件\n", fail)
+          		os.Exit(1)
+          	}
+          	fmt.Println("結果: 全項目合格")
+          }
+          '@
+          $src = ($src -split "`n" | ForEach-Object { $_ -replace '^          ', '' }) -join "`n"
+          [System.IO.File]::WriteAllText("$work\main.go", $src, (New-Object System.Text.UTF8Encoding($false)))
+          @"
+          module kstest
+
+          go 1.25.0
+
+          require golang.org/x/sys v0.44.0
+          "@ | Set-Content "$work\go.mod" -Encoding ascii
+          cd $work
+          & go mod tidy 2>&1 | Select-Object -Last 3 | Write-Host
+          & go build -o "$work\kstest.exe" . 2>&1 | Write-Host
+          if (-not (Test-Path "$work\kstest.exe")) { Write-Host "::error::試験用プログラムを組み立てられませんでした"; exit 1 }
+          Write-Host "試験用プログラムの準備ができました"
+
+      - name: この利用者で暗号化・復号できるか
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $work = "$env:RUNNER_TEMP\ks"
+          $shared = "C:\kstest"
+          New-Item -ItemType Directory -Force -Path $shared | Out-Null
+          & "$work\kstest.exe" protect-to "$shared\enc.bin" 2>&1 | Write-Host
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::この利用者での暗号化・復号が通りませんでした"; exit 1 }
+          Copy-Item "$work\kstest.exe" "$shared\kstest.exe" -Force
+          icacls $shared /grant "*S-1-5-32-545:(OI)(CI)RX" | Out-Null
+          Write-Host ("暗号化した物の大きさ: {0} バイト" -f (Get-Item "$shared\enc.bin").Length)
+
+      - name: 別の利用者では復号できないか (持ち出しの実証)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $shared = "C:\kstest"
+          # 別の利用者を作り、その利用者としてだけ復号を試す
+          $name = "kstestuser"
+          $pw = "Ks!" + [guid]::NewGuid().ToString("N").Substring(0, 16) + "aA9"
+          $sec = ConvertTo-SecureString $pw -AsPlainText -Force
+          New-LocalUser -Name $name -Password $sec -PasswordNeverExpires -AccountNeverExpires -ErrorAction SilentlyContinue | Out-Null
+          Add-LocalGroupMember -Group "Users" -Member $name -ErrorAction SilentlyContinue
+          $sid = (Get-LocalUser -Name $name).SID.Value
+          secedit /export /cfg "$shared\sec.inf" /areas USER_RIGHTS | Out-Null
+          $inf = Get-Content "$shared\sec.inf" -Encoding Unicode
+          if ($inf -match '^SeBatchLogonRight') {
+            $inf = $inf | ForEach-Object { if ($_ -match '^SeBatchLogonRight') { "$_,*$sid" } else { $_ } }
+          } else {
+            $inf = $inf | ForEach-Object { $_; if ($_ -match '^\[Privilege Rights\]') { "SeBatchLogonRight = *$sid" } }
+          }
+          $inf | Set-Content "$shared\sec.inf" -Encoding Unicode
+          secedit /configure /db "$shared\sec.sdb" /cfg "$shared\sec.inf" /areas USER_RIGHTS | Out-Null
+          $runner = @'
+          $out = "C:\kstest\other-user-result.txt"
+          "whoami=$(whoami)" | Out-File $out -Encoding utf8
+          $r = & "C:\kstest\kstest.exe" unprotect-file "C:\kstest\enc.bin" 2>&1 | Out-String
+          "exit=$LASTEXITCODE" | Out-File $out -Append -Encoding utf8
+          $r.Trim() | Out-File $out -Append -Encoding utf8
+          "done" | Out-File "C:\kstest\other-done.txt" -Encoding utf8
+          '@
+          [System.IO.File]::WriteAllText("$shared\run-other.ps1", $runner, (New-Object System.Text.UTF8Encoding($true)))
+          $act = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File C:\kstest\run-other.ps1"
+          Register-ScheduledTask -TaskName "ks-other" -Action $act -User $name -Password $pw -RunLevel Limited -Force | Out-Null
+          Start-ScheduledTask -TaskName "ks-other"
+          $deadline = (Get-Date).AddMinutes(10)
+          while (-not (Test-Path "$shared\other-done.txt") -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 10
+            $ti = Get-ScheduledTaskInfo -TaskName "ks-other"
+            Write-Host ("{0} state={1} last=0x{2:X}" -f (Get-Date -Format HH:mm:ss), (Get-ScheduledTask -TaskName "ks-other").State, $ti.LastTaskResult)
+          }
+          Write-Host "--- 別の利用者での結果 ---"
+          $res = Get-Content "$shared\other-user-result.txt" -Encoding UTF8 -ErrorAction SilentlyContinue
+          $res | Write-Host
+          if (-not $res) { Write-Host "::warning::別の利用者での実行が終わりませんでした (この項目は測れていません)"; exit 0 }
+          $joined = ($res -join " ")
+          if ($joined -match "CANNOT_DECRYPT") {
+            Write-Host "OK 別の利用者では復号できませんでした (持ち出しただけでは開けない)"
+          } elseif ($joined -match "DECRYPTED") {
+            Write-Host "::error::別の利用者が復号できてしまいました (持ち出しで開けてしまう)"
+            exit 1
+          } else {
+            Write-Host "::warning::判定できませんでした (この項目は測れていません)"
+          }
+
+      - name: 記録を保存
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-keystore-${{ inputs.version }}
+          path: C:\kstest\*.txt
           retention-days: 30
           if-no-files-found: warn
