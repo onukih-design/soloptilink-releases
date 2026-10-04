@@ -1453,7 +1453,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
-          # 日本語が化けないように出力の文字コードを UTF-8 に固定する
+          # keep output as UTF-8 so that non-ASCII text is not mangled
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           $OutputEncoding = [System.Text.Encoding]::UTF8
           Write-Host "OS=$([System.Environment]::OSVersion.VersionString) PS=$($PSVersionTable.PSVersion)"
@@ -1554,52 +1554,52 @@ jobs:
 
           	enc, err := protect(want)
           	if err != nil {
-          		fmt.Println("NG 暗号化に失敗:", err)
+          		fmt.Println("NG protect failed:", err)
           		os.Exit(1)
           	}
-          	fmt.Printf("OK 暗号化できた (%d バイト -> %d バイト)\n", len(want), len(enc))
+          	fmt.Printf("OK protected (%d bytes -> %d bytes)\n", len(want), len(enc))
 
           	if bytes.Contains(enc, want) {
-          		fmt.Println("NG 暗号化した結果に元の値がそのまま含まれている")
+          		fmt.Println("NG the plaintext is still present in the output")
           		fail++
           	} else {
-          		fmt.Println("OK 暗号化した結果に元の値は含まれていない")
+          		fmt.Println("OK the plaintext is not present in the output")
           	}
 
           	got, err := unprotect(enc)
           	if err != nil {
-          		fmt.Println("NG 復号に失敗:", err)
+          		fmt.Println("NG unprotect failed:", err)
           		fail++
           	} else if !bytes.Equal(got, want) {
-          		fmt.Printf("NG 復号した値が違う: 入=%x 出=%x\n", want, got)
+          		fmt.Printf("NG unprotected value differs: in=%x out=%x\n", want, got)
           		fail++
           	} else {
-          		fmt.Println("OK 復号して元の値に戻った")
+          		fmt.Println("OK unprotected back to the original value")
           	}
 
           	broken := append([]byte{}, enc...)
           	broken[len(broken)/2] ^= 0xff
           	if _, err := unprotect(broken); err == nil {
-          		fmt.Println("NG 書き換えた物を復号できてしまった (改ざんを検知していない)")
+          		fmt.Println("NG a tampered blob was decrypted (tampering not detected)")
           		fail++
           	} else {
-          		fmt.Println("OK 書き換えた物は復号できない (改ざんを検知する)")
+          		fmt.Println("OK a tampered blob cannot be decrypted (tampering detected)")
           	}
 
           	if len(os.Args) > 2 && os.Args[1] == "protect-to" {
           		if err := os.WriteFile(os.Args[2], enc, 0600); err != nil {
-          			fmt.Println("NG 書き出しに失敗:", err)
+          			fmt.Println("NG could not write the blob:", err)
           			fail++
           		} else {
-          			fmt.Println("OK 暗号化した物を書き出した (別の利用者で試すため)")
+          			fmt.Println("OK wrote the encrypted blob (for the other-user check)")
           		}
           	}
 
           	if fail > 0 {
-          		fmt.Printf("結果: 不合格 %d 件\n", fail)
+          		fmt.Printf("RESULT: %d failure(s)\n", fail)
           		os.Exit(1)
           	}
-          	fmt.Println("結果: 全項目合格")
+          	fmt.Println("RESULT: all checks passed")
           }
           '@
           $src = ($src -split "`n" | ForEach-Object { $_ -replace '^          ', '' }) -join "`n"
@@ -1614,8 +1614,8 @@ jobs:
           cd $work
           & go mod tidy 2>&1 | Select-Object -Last 3 | Write-Host
           & go build -o "$work\kstest.exe" . 2>&1 | Write-Host
-          if (-not (Test-Path "$work\kstest.exe")) { Write-Host "::error::試験用プログラムを組み立てられませんでした"; exit 1 }
-          Write-Host "試験用プログラムの準備ができました"
+          if (-not (Test-Path "$work\kstest.exe")) { Write-Host "::error::could not build the test program"; exit 1 }
+          Write-Host "test program is ready"
 
       - name: この利用者で暗号化・復号できるか
         shell: powershell
@@ -1626,10 +1626,10 @@ jobs:
           $shared = "C:\kstest"
           New-Item -ItemType Directory -Force -Path $shared | Out-Null
           & "$work\kstest.exe" protect-to "$shared\enc.bin" 2>&1 | Write-Host
-          if ($LASTEXITCODE -ne 0) { Write-Host "::error::この利用者での暗号化・復号が通りませんでした"; exit 1 }
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::protect/unprotect failed for this user"; exit 1 }
           Copy-Item "$work\kstest.exe" "$shared\kstest.exe" -Force
           icacls $shared /grant "*S-1-5-32-545:(OI)(CI)RX" | Out-Null
-          Write-Host ("暗号化した物の大きさ: {0} バイト" -f (Get-Item "$shared\enc.bin").Length)
+          Write-Host ("encrypted blob: {0} bytes" -f (Get-Item "$shared\enc.bin").Length)
 
       - name: 別の利用者では復号できないか (持ち出しの実証)
         shell: powershell
@@ -1637,7 +1637,7 @@ jobs:
           $ErrorActionPreference = "Continue"
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           $shared = "C:\kstest"
-          # 別の利用者を作り、その利用者としてだけ復号を試す
+          # create another local user and try to decrypt only as that user
           $name = "kstestuser"
           $pw = "Ks!" + [guid]::NewGuid().ToString("N").Substring(0, 16) + "aA9"
           $sec = ConvertTo-SecureString $pw -AsPlainText -Force
@@ -1671,18 +1671,18 @@ jobs:
             $ti = Get-ScheduledTaskInfo -TaskName "ks-other"
             Write-Host ("{0} state={1} last=0x{2:X}" -f (Get-Date -Format HH:mm:ss), (Get-ScheduledTask -TaskName "ks-other").State, $ti.LastTaskResult)
           }
-          Write-Host "--- 別の利用者での結果 ---"
+          Write-Host "--- result as the other user ---"
           $res = Get-Content "$shared\other-user-result.txt" -Encoding UTF8 -ErrorAction SilentlyContinue
           $res | Write-Host
-          if (-not $res) { Write-Host "::warning::別の利用者での実行が終わりませんでした (この項目は測れていません)"; exit 0 }
+          if (-not $res) { Write-Host "::warning::the run as the other user did not finish (NOT measured)"; exit 0 }
           $joined = ($res -join " ")
           if ($joined -match "CANNOT_DECRYPT") {
-            Write-Host "OK 別の利用者では復号できませんでした (持ち出しただけでは開けない)"
+            Write-Host "OK the other user could NOT decrypt (carrying the file away is not enough)"
           } elseif ($joined -match "DECRYPTED") {
-            Write-Host "::error::別の利用者が復号できてしまいました (持ち出しで開けてしまう)"
+            Write-Host "::error::the other user COULD decrypt (carrying the file away is enough - protection failed)"
             exit 1
           } else {
-            Write-Host "::warning::判定できませんでした (この項目は測れていません)"
+            Write-Host "::warning::could not judge (NOT measured)"
           }
 
       - name: 記録を保存
