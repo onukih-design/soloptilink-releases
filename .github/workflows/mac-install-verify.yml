@@ -1,0 +1,539 @@
+# SoloptiLinkAI — Mac 導入の実証 (機械実証)
+#
+# 【これは何か】
+#   公開済みの Mac 配布物 (Apple Silicon 版・Intel 版) を、本物の macOS 上で
+#   お客様と同じ台本 (SoloptiLinkAI-Setup.command) で新規導入し、
+#   お客様の端末で起きることを機械で確かめる。Windows 導入の実証と同じ考え方で作る。
+#
+# 【なぜ要るか — 2026-11-10】
+#   Windows には実機の実証 (windows-install-verify.yml) があるが、Mac には無かった。
+#   管理者の Mac で導入を走らせると作業中の本体が上書きされるため、手元では試せない。
+#
+# 【設計の要点 — ここを外すと偽合格になる】
+#   ① 導入の台本は最後に exit 0 する (完了画面のあと)。終了コードを合否に使わない。
+#      判定は台本自身が書く自己診断の結果 (var/self-check-results.json) と、
+#      置かれた物の実在を独立に数えた結果で出す。
+#   ② 端末の登録は行わない。Mac の台本には Windows の -NoActivate に当たる指定が無いため、
+#      入力を閉じた状態 (stdin = /dev/null) で走らせる。このとき本体は
+#      「入力を受け取れませんでした」で登録をやめ、申請は送られない。台本は続行して
+#      要対応に「端末の登録」を積む。これは測っていないものであり、合格に数えない。
+#   ③ お客様の Mac に近づけるため、実行環境が持つ道具 (Homebrew の bash・node など) を
+#      PATH から外し、/bin/bash (3.2) で台本を走らせる。Node.js と Claude Code は
+#      台本自身が用意する経路を通る。
+#   ④ 受け取った書庫には、ブラウザで受け取ったときと同じ隔離の印を付けてから
+#      ditto で展開する (Finder の展開と同じく印が中身へ引き継がれる)。
+#      ただし Gatekeeper の「開いてよいか」の確認画面は、ダブルクリック (画面操作) でしか
+#      出ないため測れない。
+#
+# 【秘密情報】
+#   1 件も使わない。配布物は公開リリースから匿名で取得する。
+#   当社への送信 (不具合の自動報告など) は、お客様も使える「その場かぎりの停止」
+#   (SOLOPTILINK_TELEMETRY_OPTOUT=1) で止める。試験の結果が本番の窓口へ届かないようにするため。
+#
+# 【置き場所】
+#   公開リポジトリ onukih-design/soloptilink-releases の .github/workflows/
+#   (公開リポジトリの macOS ランナーは無料)
+
+name: Mac 導入の実証
+run-name: "Mac 導入の実証 v${{ inputs.version }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "検証する版 (例: 2056.18)"
+        required: true
+        type: string
+      expect_sha256_arm:
+        description: "Apple Silicon 版 ZIP の SHA256 (省略時は公開の .sha256 とだけ照合する)"
+        required: false
+        type: string
+      expect_sha256_intel:
+        description: "Intel 版 ZIP の SHA256 (省略時は公開の .sha256 とだけ照合する)"
+        required: false
+        type: string
+
+# このワークフローはリポジトリへ一切書き込まない (取得と検証だけ)
+permissions:
+  contents: read
+
+jobs:
+  install-verify:
+    name: 導入を通しで実証 (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: "Apple Silicon / macOS 14"
+            runner: macos-14
+            flavor: AppleSilicon
+            arch: arm64
+          - label: "Apple Silicon / macOS 15"
+            runner: macos-15
+            flavor: AppleSilicon
+            arch: arm64
+          - label: "Intel / macOS 15"
+            runner: macos-15-intel
+            flavor: Intel
+            arch: x86_64
+
+    env:
+      SL_VER: ${{ inputs.version }}
+      SL_FLAVOR: ${{ matrix.flavor }}
+      SL_ARCH: ${{ matrix.arch }}
+      WORK: ${{ runner.temp }}/slv
+
+    steps:
+      # ── 0. 実行環境そのものを記録する ───────────────────────────────────
+      - name: 実行環境を記録
+        id: env
+        shell: bash
+        run: |
+          set -u
+          mkdir -p "$WORK"
+          mac="$(sw_vers -productVersion)"
+          build="$(sw_vers -buildVersion)"
+          m="$(uname -m)"
+          bv="$(/bin/bash -c 'echo $BASH_VERSION')"
+          echo "macOS=$mac ($build) arch=$m /bin/bash=$bv HOME=$HOME USER=$USER"
+          echo "pre-existing ~/.soloptilink: $([ -e "$HOME/.soloptilink" ] && echo yes || echo no)"
+          echo "pre-existing ~/.claude:      $([ -e "$HOME/.claude" ] && echo yes || echo no)"
+          echo "pre-existing claude cmd:     $(command -v claude || echo none)"
+          echo "Claude Desktop app:          $([ -d /Applications/Claude.app ] && echo yes || echo no)"
+          {
+            echo "macos=$mac"; echo "build=$build"; echo "arch=$m"; echo "bash=$bv"
+            echo "pre_sl=$([ -e "$HOME/.soloptilink" ] && echo yes || echo no)"
+            echo "pre_claude_dir=$([ -e "$HOME/.claude" ] && echo yes || echo no)"
+          } >> "$GITHUB_OUTPUT"
+          # アーキが違えば、その版の実証にならない
+          if [ "$m" != "$SL_ARCH" ]; then
+            echo "::error::Runner arch is $m, expected $SL_ARCH. Not a valid attestation for the $SL_FLAVOR package."
+            exit 1
+          fi
+          # 管理者端末の印があると台本は中止する。実行環境にあるはずが無いが、念のため確かめる。
+          if [ -e "$HOME/.soloptilink/.admin_mode" ]; then
+            echo "::error::admin-mode marker exists on the runner; installer would refuse to run."
+            exit 1
+          fi
+
+      # ── 1. 配布物を公開リリースから取得 (秘密情報ゼロ) ────────────────
+      - name: 配布物を取得
+        id: fetch
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${SL_VER#v}"
+          name="SoloptiLinkAI_v${ver}_Mac-${SL_FLAVOR}.zip"
+          base="https://github.com/${{ github.repository }}/releases/download/v${ver}"
+          mkdir -p "$WORK/dl"
+          # 認証情報を一切使わない (お客様と同じ条件で取得できることを同時に確かめる)
+          code="$(curl -sSL -o "$WORK/dl/$name" -w '%{http_code}' "$base/$name")"
+          echo "GET $base/$name -> HTTP $code"
+          [ "$code" = "200" ] || { echo "::error::Package download returned HTTP $code"; exit 1; }
+          code2="$(curl -sSL -o "$WORK/dl/$name.sha256" -w '%{http_code}' "$base/$name.sha256" || true)"
+          echo "GET $base/$name.sha256 -> HTTP $code2"
+          size="$(stat -f %z "$WORK/dl/$name")"
+          sha="$(shasum -a 256 "$WORK/dl/$name" | awk '{print $1}')"
+          echo "bytes=$size sha256=$sha"
+          if [ "$size" -lt 1048576 ]; then
+            echo "::error::Downloaded package is under 1MB (bytes=$size). Empty or corrupted."
+            exit 1
+          fi
+          pub=""
+          [ "$code2" = "200" ] && pub="$(awk '{print tolower($1); exit}' "$WORK/dl/$name.sha256")"
+          {
+            echo "zip=$WORK/dl/$name"; echo "name=$name"; echo "bytes=$size"
+            echo "sha256=$sha"; echo "published_sha256=$pub"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: SHA256 を照合
+        id: sha
+        shell: bash
+        env:
+          EXP_ARM: ${{ inputs.expect_sha256_arm }}
+          EXP_INTEL: ${{ inputs.expect_sha256_intel }}
+        run: |
+          set -u
+          actual="${{ steps.fetch.outputs.sha256 }}"
+          pub="${{ steps.fetch.outputs.published_sha256 }}"
+          if [ "$SL_FLAVOR" = "AppleSilicon" ]; then exp="$EXP_ARM"; else exp="$EXP_INTEL"; fi
+          exp="$(printf '%s' "$exp" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+          # (a) 公開の照合値 (お客様が見られる値) との一致は必須
+          if [ -z "$pub" ]; then
+            echo "::error::Published .sha256 could not be fetched - cannot verify the package."
+            exit 1
+          fi
+          if [ "$pub" != "$actual" ]; then
+            echo "::error::SHA256 mismatch with the published .sha256 (published=$pub actual=$actual)."
+            exit 1
+          fi
+          echo "matches the published .sha256"
+          # (b) 呼び出し側が値を渡したときはそれとも照合する
+          if [ -z "$exp" ]; then
+            echo "::notice::No caller-supplied SHA256; verified against the published .sha256 only."
+            echo "verified=published_only" >> "$GITHUB_OUTPUT"
+          elif [ "$exp" = "$actual" ]; then
+            echo "matches the caller-supplied SHA256"
+            echo "verified=published_and_caller" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::SHA256 mismatch with the caller-supplied value (expect=$exp actual=$actual)."
+            exit 1
+          fi
+
+      - name: 展開 (ブラウザで受け取ったときと同じ隔離の印を付けてから)
+        id: extract
+        shell: bash
+        run: |
+          set -euo pipefail
+          zip="${{ steps.fetch.outputs.zip }}"
+          # Safari で受け取った書庫と同じ形の印 (Finder の展開は中身へ引き継ぐ)
+          xattr -w com.apple.quarantine "0083;$(printf '%x' "$(date +%s)");Safari;" "$zip"
+          xattr -p com.apple.quarantine "$zip"
+          # お客様は ZIP をダブルクリックして展開する。Finder の書庫ユーティリティに近い ditto で展開する。
+          dst="$WORK/Downloads"
+          mkdir -p "$dst"
+          ditto -x -k "$zip" "$dst"
+          cmd="$(find "$dst" -maxdepth 2 -name 'SoloptiLinkAI-Setup.command' -type f | head -1)"
+          if [ -z "$cmd" ]; then
+            echo "::error::SoloptiLinkAI-Setup.command not found in the package."
+            find "$dst" -maxdepth 2 | head -40
+            exit 1
+          fi
+          kit="$(dirname "$cmd")"
+          bytes="$(stat -f %z "$cmd")"
+          [ "$bytes" -ge 1024 ] || { echo "::error::Setup.command is under 1KB (bytes=$bytes)."; exit 1; }
+          [ -x "$cmd" ] || { echo "::error::Setup.command lost its execute bit - double-click would not run it."; exit 1; }
+          q="$(xattr -p com.apple.quarantine "$cmd" 2>/dev/null || true)"
+          echo "kit=$kit"
+          echo "Setup.command quarantine after extract: ${q:-none}"
+          echo "はじめに_Mac.txt: $([ -f "$kit/はじめに_Mac.txt" ] && echo present || echo MISSING)"
+          {
+            echo "kit=$kit"; echo "cmd=$cmd"
+            echo "quarantine_propagated=$([ -n "$q" ] && echo yes || echo no)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 構文を確認 (/bin/bash 3.2)
+        id: syntax
+        shell: bash
+        run: |
+          set -u
+          if /bin/bash -n "${{ steps.extract.outputs.cmd }}" 2> "$WORK/syntax.err"; then
+            echo "syntax errors: 0"; echo "errors=0" >> "$GITHUB_OUTPUT"
+          else
+            cat "$WORK/syntax.err"
+            echo "::error::Setup.command does not parse under /bin/bash 3.2 - customers would crash at startup."
+            exit 1
+          fi
+
+      # ── 2. 導入を実走 ────────────────────────────────────────────────
+      #   ★お客様のダブルクリックとの違い (証跡にも残す):
+      #     ・Terminal.app を経由しない / 端末 (TTY) が無い → 入力は閉じた状態 (stdin=/dev/null)
+      #     ・その結果、端末の登録は「入力を受け取れません」で行われない (申請も送られない)
+      #   ★終了コードは判定に使わない。
+      - name: 導入を実走 (お客様と同じ台本 / 端末の登録なし)
+        id: install
+        shell: bash
+        run: |
+          set -u
+          cmd="${{ steps.extract.outputs.cmd }}"
+          date -u +%s > "$WORK/install.start"
+          t0=$(date +%s)
+          cd "$HOME"
+          # お客様の Mac に近い最小の環境で走らせる (Homebrew の bash / node などを見せない)
+          env -i \
+            HOME="$HOME" USER="$USER" LOGNAME="$USER" SHELL=/bin/zsh \
+            TMPDIR="${TMPDIR:-/tmp}" TERM=xterm-256color \
+            LANG=ja_JP.UTF-8 LC_ALL=ja_JP.UTF-8 \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            SOLOPTILINK_TELEMETRY_OPTOUT=1 \
+            /bin/bash "$cmd" < /dev/null > "$WORK/install.log" 2>&1
+          rc=$?
+          sec=$(( $(date +%s) - t0 ))
+          cat "$WORK/install.log"
+          echo "----- installer exit code: $rc (NOT used for the verdict) / elapsed ${sec}s -----"
+          { echo "rc=$rc"; echo "seconds=$sec"; } >> "$GITHUB_OUTPUT"
+
+      - name: 止まった工程と完了画面を判定
+        id: halt
+        shell: bash
+        run: |
+          set -u
+          log="$WORK/install.log"
+          halted=""
+          for f in "$HOME/.soloptilink/logs/setup-error.log" "${TMPDIR:-/tmp}/setup-error.log"; do
+            if [ -f "$f" ] && grep -q 'installer-failure' "$f"; then
+              halted="$(grep 'installer-failure' "$f" | head -1)"; break
+            fi
+          done
+          # 完了画面まで来たか (台本の最後の画面の文言で見る)
+          reached_end=0; grep -q 'Enterキーで閉じます' "$log" && grep -q 'サポート: nomura.y@soloptilink.com' "$log" && reached_end=1
+          banner="none"
+          grep -q 'セットアップ完了！' "$log" && banner="complete"
+          grep -q 'セットアップは一部が未完了です' "$log" && banner="partial"
+          # 要対応の項目名を取り出す (「    ・名前: 案内」の形)
+          sed -n '/【要対応】/,/まず上記を解消/p' "$log" | grep -E '^    ・' | sed -E 's/^    ・([^:]+):.*/\1/' > "$WORK/issues.txt" || true
+          echo "halted: ${halted:-none}"
+          echo "reached completion screen: $reached_end / banner: $banner"
+          echo "--- 要対応 (items) ---"; cat "$WORK/issues.txt"
+          # この環境で当然出る項目 (測っていないもの) と、それ以外を分ける
+          #   端末の登録       : 入力を閉じて走らせているので必ず出る (測っていない)
+          #   導入の自己診断   : 端末の登録の × に引きずられて出る。中身は次の段で 1 項目ずつ判定する
+          unexpected="$(grep -v -x -E '端末の登録|導入の自己診断' "$WORK/issues.txt" || true)"
+          n_issue="$(grep -c . "$WORK/issues.txt" || true)"
+          {
+            echo "halted=$halted"; echo "reached_end=$reached_end"; echo "banner=$banner"
+            echo "issues_n=$n_issue"
+            echo "unexpected=$(printf '%s' "$unexpected" | tr '\n' '/' )"
+          } >> "$GITHUB_OUTPUT"
+          ok=1
+          if [ -n "$halted" ]; then echo "::error::Install halted midway: $halted"; ok=0; fi
+          if [ "$reached_end" != 1 ]; then echo "::error::The completion screen was not reached."; ok=0; fi
+          if [ -n "$unexpected" ]; then
+            while IFS= read -r u; do echo "::error::Unexpected action item on the completion screen: $u"; done <<< "$unexpected"
+            ok=0
+          fi
+          grep -q 'ACTIVATION_NO_INPUT\|キーボードからの入力を受け取れませんでした' "$log" \
+            && echo "device activation: skipped because input is closed (as designed - no request sent)" \
+            || echo "::warning::Did not see the 'no input' message from activation - check the log."
+          [ "$ok" = 1 ] || exit 1
+
+      # ── 3. 置かれた物を独立に数える ──────────────────────────────────
+      #   ★台本の自己申告ではなく、ファイルの実在で数える。
+      - name: 置かれた物を数える
+        id: placed
+        shell: bash
+        run: |
+          set -u
+          SL="$HOME/.soloptilink"; CL="$HOME/.claude"; ok=1
+          # (a) 本体の版
+          v="$(tr -d '[:space:]' < "$SL/VERSION" 2>/dev/null || true)"
+          echo "~/.soloptilink/VERSION: ${v:-missing}"
+          if [ "$v" != "${SL_VER#v}" ]; then echo "::error::Installed VERSION is '${v:-missing}', expected ${SL_VER#v}."; ok=0; fi
+          # (b) 本体のプログラム: 在る・アーキが合う・動く
+          bin="$SL/soloptilink"; bin_ok=0; bin_arch=""
+          if [ -x "$bin" ]; then
+            bin_arch="$(lipo -archs "$bin" 2>/dev/null || file -b "$bin")"
+            out="$("$bin" --version 2>&1 < /dev/null | head -3 || true)"
+            echo "launcher arch: $bin_arch / --version: $out"
+            case "$bin_arch" in *"$SL_ARCH"*) [ -n "$out" ] && bin_ok=1 ;; esac
+          fi
+          [ "$bin_ok" = 1 ] || { echo "::error::Launcher missing, wrong arch, or produced no output."; ok=0; }
+          # (c) 呼び出し口 (スキル) の数と中身
+          n=0; [ -d "$CL/skills" ] && n="$(find "$CL/skills" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')"
+          echo "skill dirs: $n"
+          [ "$n" -ge 1 ] || { echo "::error::No skills were placed."; ok=0; }
+          bs=0; [ -f "$CL/skills/soloptilink-boost/SKILL.md" ] && bs="$(stat -f %z "$CL/skills/soloptilink-boost/SKILL.md")"
+          echo "soloptilink-boost/SKILL.md: $bs bytes"
+          [ "$bs" -ge 1024 ] || { echo "::error::soloptilink-boost body is missing or empty."; ok=0; }
+          ls -1 "$CL/skills" 2>/dev/null | sed 's/^/  - /'
+          # (d) 管理者専用のスキルが混ざっていないか
+          leak=""
+          for a in soloptilink-release soloptilink-deploy soloptilink-doctor; do [ -e "$CL/skills/$a" ] && leak="$leak $a"; done
+          if [ -n "$leak" ]; then echo "::error::admin-only skills leaked:$leak"; ok=0; else echo "admin-only leak: none"; fi
+          # (e) 担当ロール
+          ag=0; [ -d "$CL/agents" ] && ag="$(find "$CL/agents" -maxdepth 1 -name '*.md' -type f | wc -l | tr -d ' ')"
+          echo "agent definitions: $ag"
+          [ "$ag" -ge 1 ] || { echo "::error::No agent definitions were placed."; ok=0; }
+          # (f) 自動更新の見張り: settings.json の SessionStart に auto-update.sh があり、その台本が実在するか
+          hook="$(/usr/bin/python3 -I - "$CL/settings.json" <<'PY'
+          import json, os, re, sys
+          p = sys.argv[1]
+          try:
+              d = json.load(open(p, encoding="utf-8"))
+          except Exception as e:
+              print("unreadable"); sys.exit(0)
+          cmds = []
+          for blk in (d.get("hooks") or {}).get("SessionStart") or []:
+              for h in blk.get("hooks") or []:
+                  c = h.get("command") or ""
+                  if "auto-update.sh" in c:
+                      cmds.append(c)
+          if not cmds:
+              print("absent"); sys.exit(0)
+          m = re.search(r"(~|\$HOME|/[^ \"']*)?/?\.soloptilink/auto-update\.sh", cmds[0])
+          path = os.path.expanduser("~/.soloptilink/auto-update.sh")
+          print("present" if os.path.isfile(path) else "present_but_script_missing")
+          PY
+          )"
+          echo "auto-update hook (SessionStart): $hook"
+          [ "$hook" = "present" ] || { echo "::error::Auto-update hook not effective ($hook) - this customer would never receive updates."; ok=0; }
+          nh="$(grep -o '\.soloptilink/' "$CL/settings.json" 2>/dev/null | wc -l | tr -d ' ')"
+          echo "settings.json references to ~/.soloptilink: $nh"
+          # (g) 隔離の印が本体に残っていないか (残ると、ダブルクリックや実行で止められうる)
+          qn="$(xattr -lr "$SL" 2>/dev/null | grep -c 'com.apple.quarantine' || true)"
+          echo "quarantine attributes left under ~/.soloptilink: $qn"
+          [ "$qn" = 0 ] || { echo "::error::$qn quarantined file(s) left under ~/.soloptilink."; ok=0; }
+          # (h) 記録のみ: Claude Desktop の設定 (アプリは実行環境に無い)
+          mcp="$HOME/Library/Application Support/Claude/claude_desktop_config.json"
+          mcpst="absent"; [ -f "$mcp" ] && { grep -q '"soloptilink"' "$mcp" && mcpst="entry_present" || mcpst="file_without_entry"; }
+          echo "Claude Desktop config (record only): $mcpst"
+          # (i) 記録のみ: 台本が用意した Claude Code / Node.js
+          cc="$("$HOME/.local/bin/claude" --version 2>/dev/null | head -1 || true)"
+          echo "Claude Code placed by the installer (record only): ${cc:-none}"
+          {
+            echo "version=$v"; echo "bin_arch=$bin_arch"; echo "bin_ok=$bin_ok"
+            echo "skills_dirs=$n"; echo "boost_bytes=$bs"; echo "admin_leak=$(echo $leak | wc -w | tr -d ' ')"
+            echo "agents=$ag"; echo "hook=$hook"; echo "quarantine_left=$qn"; echo "mcp_config=$mcpst"
+            echo "claude_code=$cc"
+          } >> "$GITHUB_OUTPUT"
+          [ "$ok" = 1 ] || exit 1
+
+      # ── 4. 出荷物自身の自己診断 (主判定) ──────────────────────────────
+      #   台本が導入の中で走らせた結果 (お客様の画面に出たもの) を第一の出典にする。
+      #   あわせて、導入後に同じ診断を独立に走らせ、食い違いを記録する。
+      - name: 自己診断の結果を取り出す
+        id: selfcheck
+        shell: bash
+        run: |
+          set -u
+          SL="$HOME/.soloptilink"; res="$SL/var/self-check-results.json"
+          start="$(cat "$WORK/install.start")"
+          if [ ! -s "$res" ]; then
+            echo "::error::The installer did not leave a self-check result (not measured = not a pass)."
+            exit 1
+          fi
+          mt="$(stat -f %m "$res")"
+          if [ "$mt" -lt "$start" ]; then
+            echo "::error::self-check result predates this install (stale) - not a measurement of this run."
+            exit 1
+          fi
+          cp "$res" "$WORK/selfcheck-installer.json"
+          # 独立の再実行 (導入後に開いた新しいターミナルに近い環境)
+          if [ -f "$SL/installer/self-check.sh" ]; then
+            env -i HOME="$HOME" USER="$USER" TMPDIR="${TMPDIR:-/tmp}" LANG=ja_JP.UTF-8 \
+              PATH="$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin" SOLOPTILINK_TELEMETRY_OPTOUT=1 \
+              /bin/bash "$SL/installer/self-check.sh" json > "$WORK/selfcheck-rerun.json" 2> "$WORK/selfcheck-rerun.err" || true
+          else
+            echo "::warning::installed self-check.sh not found; rerun skipped"
+          fi
+          echo "--- installer-run verdict ---"; cat "$WORK/selfcheck-installer.json"
+
+      - name: 自己診断の判定を読む
+        id: verdict
+        shell: bash
+        run: |
+          set -u
+          /usr/bin/python3 -I - "$WORK/selfcheck-installer.json" "$WORK/selfcheck-rerun.json" "$GITHUB_OUTPUT" <<'PY'
+          import json, sys
+          main_p, rerun_p, out_p = sys.argv[1:4]
+          # この環境では測れない項目。合格にも不合格にも数えず「未測定」として証跡に残す。
+          #   device_activation : 入力を閉じて走らせるため、登録は行っていない
+          #   mcp_registration  : Claude Desktop のアプリが実行環境に無い (設定の有無は別に記録)
+          SKIP = {"device_activation", "mcp_registration"}
+          def load(p):
+              try:
+                  return json.load(open(p, encoding="utf-8"))
+              except Exception:
+                  return None
+          d = load(main_p)
+          if not d or not d.get("checks"):
+              print("::error::self-check verdict is unreadable or empty (not measured = not a pass).")
+              sys.exit(1)
+          ok = fail = unm = 0
+          rows = []
+          for c in d["checks"]:
+              cid = c.get("id"); v = str(c.get("verdict", "")).upper()
+              rows.append((cid, v))
+              line = "%-12s %-20s %s" % (v, cid, c.get("reason_ja", ""))
+              if cid in SKIP:
+                  unm += 1; print("NOT MEASURED (by design) - " + line); continue
+              if v == "PASS":
+                  ok += 1; print("PASS         - " + line)
+              elif v == "FAIL":
+                  fail += 1; print("::error::self-check FAILED - %s : %s" % (cid, c.get("reason_ja", "")))
+              elif v == "NOT_APPLICABLE":
+                  print("N/A          - " + line)
+              else:
+                  unm += 1; print("::warning::NOT MEASURED - %s (%s) %s" % (cid, v, c.get("reason_ja", "")))
+          print("pass %d / fail %d / not-measured %d (of %d)" % (ok, fail, unm, len(rows)))
+          # 独立の再実行との食い違い (記録のみ)
+          r = load(rerun_p)
+          diff = []
+          if r and r.get("checks"):
+              rv = {c.get("id"): str(c.get("verdict", "")).upper() for c in r["checks"]}
+              for cid, v in rows:
+                  if rv.get(cid) != v:
+                      diff.append("%s:%s->%s" % (cid, v, rv.get(cid)))
+              print("rerun differences: " + (", ".join(diff) if diff else "none"))
+          else:
+              diff = ["rerun_unreadable"]
+              print("::warning::independent rerun produced no readable verdict")
+          with open(out_p, "a", encoding="utf-8") as f:
+              f.write("pass_n=%d\nfail_n=%d\nunmeasured_n=%d\ntotal_n=%d\n" % (ok, fail, unm, len(rows)))
+              f.write("overall=%s\n" % d.get("verdict", ""))
+              f.write("rerun_diff=%s\n" % ("/".join(diff) if diff else "none"))
+          sys.exit(1 if fail else 0)
+          PY
+
+      - name: 証跡を作成
+        if: always()
+        shell: bash
+        env:
+          J_STATUS: ${{ job.status }}
+          O_ENV: ${{ toJSON(steps.env.outputs) }}
+          O_FETCH: ${{ toJSON(steps.fetch.outputs) }}
+          O_SHA: ${{ toJSON(steps.sha.outputs) }}
+          O_EXTRACT: ${{ toJSON(steps.extract.outputs) }}
+          O_SYNTAX: ${{ toJSON(steps.syntax.outputs) }}
+          O_INSTALL: ${{ toJSON(steps.install.outputs) }}
+          O_HALT: ${{ toJSON(steps.halt.outputs) }}
+          O_PLACED: ${{ toJSON(steps.placed.outputs) }}
+          O_VERDICT: ${{ toJSON(steps.verdict.outputs) }}
+          M_LABEL: ${{ matrix.label }}
+          M_RUNNER: ${{ matrix.runner }}
+        run: |
+          mkdir -p "$WORK/attest"
+          /usr/bin/python3 -I - "$WORK/attest/mac-ci-attestation.json" <<'PY'
+          import json, os, sys, datetime
+          g = lambda k: json.loads(os.environ.get(k) or "{}")
+          rec = {
+            "kind": "machine",
+            "platform": "macos",
+            "version": os.environ.get("SL_VER"),
+            "flavor": os.environ.get("SL_FLAVOR"),
+            "matrix": {"label": os.environ.get("M_LABEL"), "runner": os.environ.get("M_RUNNER")},
+            "result": os.environ.get("J_STATUS"),
+            "at": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "run": {"id": os.environ.get("GITHUB_RUN_ID"), "attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+                    "url": "%s/%s/actions/runs/%s" % (os.environ.get("GITHUB_SERVER_URL"), os.environ.get("GITHUB_REPOSITORY"), os.environ.get("GITHUB_RUN_ID"))},
+            "runner": g("O_ENV"),
+            "package": {**g("O_FETCH"), **{"sha256_verified": g("O_SHA").get("verified")}},
+            "stages": {
+              "extract": g("O_EXTRACT"), "syntax": g("O_SYNTAX"), "install": g("O_INSTALL"),
+              "halt_and_completion": g("O_HALT"), "placed": g("O_PLACED"), "selfcheck": g("O_VERDICT"),
+            },
+            "how_it_was_run": [
+              "Same SoloptiLinkAI-Setup.command as customers, unmodified, run by /bin/bash 3.2",
+              "stdin=/dev/null (no TTY), minimal env PATH=/usr/bin:/bin:/usr/sbin:/sbin, LANG=ja_JP.UTF-8",
+              "SOLOPTILINK_TELEMETRY_OPTOUT=1 (customer-available opt-out) so no reports reach production",
+              "ZIP given a Safari-style quarantine attribute, then extracted with ditto"
+            ],
+            "not_measured": [
+              "Device activation: input is closed, so the launcher stops before sending any request",
+              "Double-click launch via Finder/Terminal.app and the Gatekeeper open-confirmation dialog: requires GUI interaction",
+              "Claude Desktop actually loading the config: the app is not on the runner",
+              "Claude Code sign-in and paid-plan usage: requires a user account",
+              "Truly fresh Mac without Xcode Command Line Tools: runner images ship Xcode, so git/python3 already work",
+              "Managed (MDM) Macs, standard (non-admin) user accounts, FileVault-locked homes"
+            ]
+          }
+          json.dump(rec, open(sys.argv[1], "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+          print(json.dumps(rec, ensure_ascii=False, indent=2))
+          PY
+          # 実行ログ類を集める
+          cp "$WORK/install.log" "$WORK/attest/" 2>/dev/null || true
+          cp "$WORK/selfcheck-installer.json" "$WORK/selfcheck-rerun.json" "$WORK/selfcheck-rerun.err" "$WORK/issues.txt" "$WORK/attest/" 2>/dev/null || true
+          mkdir -p "$WORK/attest/sl-logs"
+          cp -R "$HOME/.soloptilink/logs/." "$WORK/attest/sl-logs/" 2>/dev/null || true
+          cp "$HOME/.claude/settings.json" "$WORK/attest/claude-settings.json" 2>/dev/null || true
+
+      - name: 証跡を保存
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-ci-attestation-${{ inputs.version }}-${{ matrix.runner }}
+          path: ${{ runner.temp }}/slv/attest/
+          retention-days: 90
+          if-no-files-found: warn
