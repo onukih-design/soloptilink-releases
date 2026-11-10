@@ -66,8 +66,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - label: "Apple Silicon / macOS 14"
-            runner: macos-14
+          # macos-14 は GitHub 側で提供終了 (2026-11-10 実測: configuration not supported)
+          - label: "Apple Silicon / macOS 26"
+            runner: macos-26
             flavor: AppleSilicon
             arch: arm64
           - label: "Apple Silicon / macOS 15"
@@ -310,9 +311,10 @@ jobs:
           set -u
           SL="$HOME/.soloptilink"; CL="$HOME/.claude"; ok=1
           # (a) 本体の版
+          # VERSION は「v2056.18」の形で書かれる。頭の v の有無は同じ版として比べる
           v="$(tr -d '[:space:]' < "$SL/VERSION" 2>/dev/null || true)"
           echo "~/.soloptilink/VERSION: ${v:-missing}"
-          if [ "$v" != "${SL_VER#v}" ]; then echo "::error::Installed VERSION is '${v:-missing}', expected ${SL_VER#v}."; ok=0; fi
+          if [ "${v#v}" != "${SL_VER#v}" ]; then echo "::error::Installed VERSION is '${v:-missing}', expected ${SL_VER#v}."; ok=0; fi
           # (b) 本体のプログラム: 在る・アーキが合う・動く
           bin="$SL/soloptilink"; bin_ok=0; bin_arch=""
           if [ -x "$bin" ]; then
