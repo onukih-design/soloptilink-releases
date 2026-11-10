@@ -205,6 +205,13 @@ jobs:
             exit 1
           fi
           kit="$(dirname "$cmd")"
+          # 2026-11-10 からの並べ方: ZIP の直下に入口の .command (中で app/SoloptiLinkAI-Setup.command を呼ぶ)。
+          # お客様が押すのは直下の入口なので、あればそれで実走する (無いときは従来どおり本体の台本)。
+          entry="$(find "$dst" -maxdepth 1 -name '*.command' -type f | head -1)"
+          [ -n "$entry" ] || entry="$cmd"
+          [ -x "$entry" ] || { echo "::error::The top-level entry lost its execute bit - double-click would not run it."; exit 1; }
+          /bin/bash -n "$entry" || { echo "::error::The top-level entry does not parse under /bin/bash 3.2."; exit 1; }
+          echo "entry=$entry"
           bytes="$(stat -f %z "$cmd")"
           [ "$bytes" -ge 1024 ] || { echo "::error::Setup.command is under 1KB (bytes=$bytes)."; exit 1; }
           [ -x "$cmd" ] || { echo "::error::Setup.command lost its execute bit - double-click would not run it."; exit 1; }
@@ -213,7 +220,7 @@ jobs:
           echo "Setup.command quarantine after extract: ${q:-none}"
           echo "はじめに_Mac.txt: $([ -f "$kit/はじめに_Mac.txt" ] && echo present || echo MISSING)"
           {
-            echo "kit=$kit"; echo "cmd=$cmd"
+            echo "kit=$kit"; echo "cmd=$cmd"; echo "entry=$entry"
             echo "quarantine_propagated=$([ -n "$q" ] && echo yes || echo no)"
           } >> "$GITHUB_OUTPUT"
 
@@ -240,7 +247,7 @@ jobs:
         shell: bash
         run: |
           set -u
-          cmd="${{ steps.extract.outputs.cmd }}"
+          cmd="${{ steps.extract.outputs.entry }}"
           date -u +%s > "$WORK/install.start"
           t0=$(date +%s)
           cd "$HOME"

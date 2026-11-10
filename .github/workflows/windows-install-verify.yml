@@ -693,7 +693,10 @@ jobs:
                     Test-Path (Join-Path $_.FullName "installer\soloptilink-install.ps1") }
           if ($cand) { $root = $cand[0].FullName }
           # 最上位の起動口 (.bat) を名前ではなく場所で探す (日本語のファイル名をこの手順に書かない)
-          $bat = Get-ChildItem -Path $root -Filter "*.bat" -File | Select-Object -First 1
+          # 2026-11-10 からの並べ方: ZIP の直下 ($dst) に入口の .bat、本体は app\ に入る。
+          # お客様が押すのは直下の入口なので、直下を先に探し、無いとき (従来の並べ方) だけ本体の階層を探す。
+          $bat = Get-ChildItem -Path $dst -Filter "*.bat" -File | Select-Object -First 1
+          if (-not $bat) { $bat = Get-ChildItem -Path $root -Filter "*.bat" -File | Select-Object -First 1 }
           if (-not $bat) { Write-Host "::error::No .bat entry at the top of the package: $root"; exit 1 }
           Write-Host "root=$root"
           Write-Host "entry=$($bat.FullName)"
@@ -1364,7 +1367,9 @@ jobs:
           Expand-Archive -Path $zip -DestinationPath $dst -Force
           Get-ChildItem -Path $dst -Recurse -File | ForEach-Object { Set-Content -LiteralPath $_.FullName -Stream Zone.Identifier -Value "[ZoneTransfer]`r`nZoneId=3" -Encoding Ascii -ErrorAction SilentlyContinue }
           $root = (Get-ChildItem -Path $dst -Directory | Where-Object { Test-Path (Join-Path $_.FullName "installer\soloptilink-install.ps1") } | Select-Object -First 1).FullName
-          $bat = Get-ChildItem -Path $root -Filter "*.bat" -File | Select-Object -First 1
+          # 直下の入口を先に (2026-11-10 からの並べ方)。無いときは従来どおり本体の階層の .bat
+          $bat = Get-ChildItem -Path $dst -Filter "*.bat" -File | Select-Object -First 1
+          if (-not $bat) { $bat = Get-ChildItem -Path $root -Filter "*.bat" -File | Select-Object -First 1 }
           "entry=$($bat.FullName)" | Out-File $log -Append -Encoding utf8
           $env:SOLOPTILINK_NO_END_PAUSE = "1"
           $env:SOLOPTILINK_INSTALL_NO_ACTIVATE = "1"
