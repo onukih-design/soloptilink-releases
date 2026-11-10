@@ -83,7 +83,6 @@ jobs:
       SL_VER: ${{ inputs.version }}
       SL_FLAVOR: ${{ matrix.flavor }}
       SL_ARCH: ${{ matrix.arch }}
-      WORK: ${{ runner.temp }}/slv
 
     steps:
       # ── 0. 実行環境そのものを記録する ───────────────────────────────────
@@ -92,6 +91,9 @@ jobs:
         shell: bash
         run: |
           set -u
+          # 作業の置き場 (ジョブの env では runner.temp を使えないため、ここで決める)
+          WORK="$RUNNER_TEMP/slv"
+          echo "WORK=$WORK" >> "$GITHUB_ENV"
           mkdir -p "$WORK"
           mac="$(sw_vers -productVersion)"
           build="$(sw_vers -buildVersion)"
