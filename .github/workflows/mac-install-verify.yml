@@ -384,6 +384,37 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           [ "$ok" = 1 ] || exit 1
 
+      # ── 3.5 導入の後の新しい画面から Node.js が見えるか (記録と警告) ──────────
+      #   台本は Node.js が無い Mac では本体の中 (~/.soloptilink/runtime/node) へ置くが、
+      #   その場所を通り道 (PATH) に加えるのは導入中の画面の中だけ。導入の後に開く
+      #   ターミナルや Claude Code が読む設定から辿れるかを、実行環境の持ち物
+      #   (Homebrew や事前導入の node) に左右されない形で、設定の中身から数える。
+      #   2026-11-10 の実測で見つかった点。製品の判断が要るため、ここでは不合格にせず警告と証跡に残す。
+      - name: 導入の後の新しい画面から Node.js が見えるか
+        id: nodereach
+        shell: bash
+        run: |
+          set -u
+          SL="$HOME/.soloptilink"; rt="$SL/runtime/node"
+          provisioned=no; [ -x "$rt/current/bin/node" ] && provisioned=yes
+          echo "Node.js placed by the installer under ~/.soloptilink/runtime/node: $provisioned"
+          refs=""
+          for f in "$HOME/.zshrc" "$HOME/.zprofile" "$HOME/.zshenv" "$HOME/.bash_profile" "$HOME/.profile" /etc/paths /etc/paths.d/* /etc/zshrc /etc/zprofile; do
+            [ -f "$f" ] && grep -q -E '\.soloptilink/runtime/node|runtime/node/env\.sh' "$f" && refs="$refs $f"
+          done
+          cs="no"
+          /usr/bin/python3 -I -c 'import json,os,sys; d=json.load(open(os.path.expanduser("~/.claude/settings.json"))); sys.exit(0 if ".soloptilink/runtime/node" in str((d.get("env") or {}).get("PATH","")) else 1)' 2>/dev/null && cs="yes"
+          echo "shell startup files referencing it: ${refs:-none}"
+          echo "~/.claude/settings.json env.PATH includes it: $cs"
+          reach=n/a
+          if [ "$provisioned" = yes ]; then
+            if [ -n "$refs" ] || [ "$cs" = yes ]; then reach=yes; else reach=no; fi
+          fi
+          if [ "$reach" = no ]; then
+            echo "::warning::Node.js placed by the installer is reachable only inside the installer session. A new Terminal or Claude Code session will not find node/npm/npx (self-check rerun reports nodejs FAIL)."
+          fi
+          { echo "provisioned=$provisioned"; echo "reachable_after_install=$reach"; } >> "$GITHUB_OUTPUT"
+
       # ── 4. 出荷物自身の自己診断 (主判定) ──────────────────────────────
       #   台本が導入の中で走らせた結果 (お客様の画面に出たもの) を第一の出典にする。
       #   あわせて、導入後に同じ診断を独立に走らせ、食い違いを記録する。
@@ -485,6 +516,7 @@ jobs:
           O_HALT: ${{ toJSON(steps.halt.outputs) }}
           O_PLACED: ${{ toJSON(steps.placed.outputs) }}
           O_VERDICT: ${{ toJSON(steps.verdict.outputs) }}
+          O_NODE: ${{ toJSON(steps.nodereach.outputs) }}
           M_LABEL: ${{ matrix.label }}
           M_RUNNER: ${{ matrix.runner }}
         run: |
@@ -507,6 +539,7 @@ jobs:
             "stages": {
               "extract": g("O_EXTRACT"), "syntax": g("O_SYNTAX"), "install": g("O_INSTALL"),
               "halt_and_completion": g("O_HALT"), "placed": g("O_PLACED"), "selfcheck": g("O_VERDICT"),
+              "node_after_install": g("O_NODE"),
             },
             "how_it_was_run": [
               "Same SoloptiLinkAI-Setup.command as customers, unmodified, run by /bin/bash 3.2",
