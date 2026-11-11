@@ -99,6 +99,11 @@ on:
 permissions:
   contents: write
 
+# ★2026-11-11: 導入の台本は最後に「スラッシュの一覧に出るか」の結果を当社へ送る (lib/slash-doctor/SPEC.md 4 節)。
+#   実証の実行がお客様の記録に混ざらないよう、このワークフローの全ジョブで送らない。
+env:
+  SOLOPTILINK_SLASH_REPORT: "off"
+
 jobs:
   install-verify:
     name: 導入を通しで実証 (Windows Server / PowerShell 5.1)
@@ -359,6 +364,72 @@ jobs:
           "hook=$hook"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           if (-not $ok) { exit 1 }
 
+      # ── 4b. スラッシュの一覧に出る形で置かれたか (slash-doctor・2026-11-11) ─────
+      #   ★インストーラの自己申告ではなく、配布物に同梱の診断 (installer\slash-doctor.ps1・
+      #     共通の決めごと lib/slash-doctor/SPEC.md の符丁) で読む。調べるだけ (-Mode check)。
+      #     ここで置き直すと、置き直した結果で合格してしまうため。
+      #   ★ランナーには Claude Code が無いため、Claude Code を起動して一覧を読む実測はできない。
+      #     合格は PLACED_UNVERIFIED 以上 (VISIBLE か PLACED_UNVERIFIED)。NOT_VISIBLE (置き場所の欠け・
+      #     先頭の壊れ・本体の古さ) と、判定が読めないとき (空) は不合格。
+      #   ★導入の途中 (STEP 8.6) で診断が置き直していた (FIXED_REPLACED) ときは、STEP 8.5 の置き方が
+      #     壊れている合図なので警告を出す (お客様の端末は診断が直すので不合格にはしない)。
+      - name: スラッシュの一覧に出る形で置かれたか (slash-doctor)
+        id: slash
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $doc = Join-Path $env:USERPROFILE ".soloptilink\installer\slash-doctor.ps1"
+          if (-not (Test-Path $doc)) {
+            $doc = Join-Path "${{ steps.extract.outputs.root }}" "installer\slash-doctor.ps1"
+          }
+          if (-not (Test-Path $doc)) {
+            Write-Host "::error::installer\slash-doctor.ps1 is not in the package - the installer cannot check whether /soloptilink-boost appears in the slash list."
+            "overall=MISSING" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            exit 1
+          }
+          $errs = $null
+          $null = [System.Management.Automation.PSParser]::Tokenize((Get-Content -Raw $doc), [ref]$errs)
+          if ($errs -and $errs.Count -gt 0) {
+            $errs | Select-Object -First 5 | ForEach-Object { Write-Host ("  line {0}: {1}" -f $_.Token.StartLine, $_.Message) }
+            Write-Host "::error::slash-doctor.ps1 has $($errs.Count) syntax error(s) under PowerShell 5.1."
+            exit 1
+          }
+          $raw = & $doc -Mode check -Json -Entry doctor-cli 2>&1 | Out-String
+          # 診断の終了コードは Mac と同じ (0=VISIBLE・1=PLACED_UNVERIFIED・2=NOT_VISIBLE)。
+          #   GitHub の PowerShell の段は最後の終了コードで成否を決めるため、控えてから 0 に戻し、判定は JSON で行う。
+          $docRc = $LASTEXITCODE
+          $global:LASTEXITCODE = 0
+          Write-Host $raw
+          Write-Host "slash-doctor exit code: $docRc"
+          $json = @($raw -split "`r?`n" | Where-Object { $_.TrimStart().StartsWith('{') }) | Select-Object -Last 1
+          $r = $null
+          try { $r = $json | ConvertFrom-Json } catch { $r = $null }
+          $overall = ''
+          $codes = ''
+          if ($r) {
+            $overall = [string]$r.overall
+            $codes = (@($r.codes) -join ',')
+          }
+          Write-Host "slash-doctor overall=$overall codes=$codes"
+          "overall=$overall" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "codes=$codes"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          # 導入の途中で診断が置き直したか (setup_detail.txt の控えから読む)
+          $early = ''
+          $detail = Join-Path $env:USERPROFILE ".soloptilink\setup_detail.txt"
+          if (Test-Path $detail) {
+            $hit = Select-String -Path $detail -Pattern "slash-doctor: mode=fix" -SimpleMatch | Select-Object -First 1
+            if ($hit) { $early = $hit.Line.Trim() }
+          }
+          Write-Host "installer early check: $early"
+          if ($early -match 'FIXED_REPLACED') {
+            Write-Host "::warning::The slash doctor had to re-place the skills during install (STEP 8.6). STEP 8.5 did not place them correctly."
+          }
+          if ($overall -ne 'VISIBLE' -and $overall -ne 'PLACED_UNVERIFIED') {
+            Write-Host "::error::slash-doctor overall is '$overall' (need PLACED_UNVERIFIED or VISIBLE) - customers would not see /soloptilink-boost in the slash list."
+            exit 1
+          }
+          exit 0
+
       # ── 5. 置いたものが動く (段階 4) ───────────────────────────────────
       - name: 本体が起動するか
         id: exe
@@ -496,6 +567,8 @@ jobs:
               admin_leak                  = "${{ steps.placed.outputs.admin_leak }}"
               agents_placed               = "${{ steps.placed.outputs.agents }}"
               autoupdate_hook             = "${{ steps.placed.outputs.hook }}"
+              slash_overall               = "${{ steps.slash.outputs.overall }}"
+              slash_codes                 = "${{ steps.slash.outputs.codes }}"
               exe_ran                     = "${{ steps.exe.outputs.ran }}"
               selfcheck_pass              = "${{ steps.verdict.outputs.pass_n }}"
               selfcheck_fail              = "${{ steps.verdict.outputs.fail_n }}"
@@ -509,6 +582,7 @@ jobs:
               "Claude Desktop actually loading the config: the app is not on the runner",
               "Device activation: intentionally skipped via -NoActivate",
               "Prerequisite developer tools (Claude Code): not installed on the runner",
+              "Slash list probe (start Claude Code and read /soloptilink-boost from its init): Claude Code is not on the runner, so slash-doctor can reach PLACED_UNVERIFIED at most",
               "Double-click launch: requires GUI interaction"
             )
           }
