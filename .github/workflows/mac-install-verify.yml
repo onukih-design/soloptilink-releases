@@ -57,6 +57,11 @@ on:
 permissions:
   contents: read
 
+# ★2026-11-11: 導入の台本は最後に「スラッシュの一覧に出るか」の結果を当社へ送る (lib/slash-doctor)。
+#   実証の実行がお客様の記録に混ざらないよう、このワークフローの全ジョブで送らない (Windows 側と同じ)。
+env:
+  SOLOPTILINK_SLASH_REPORT: "off"
+
 jobs:
   install-verify:
     name: 導入を通しで実証 (${{ matrix.label }})
