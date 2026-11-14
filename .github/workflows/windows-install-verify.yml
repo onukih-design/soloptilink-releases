@@ -488,6 +488,25 @@ jobs:
           echo "--- verdict ---"
           cat "$RUNNER_TEMP/selfcheck.json"
 
+      # ── 6b. 知らない問題を解く仕組み (v2058 で新しく配る) の自己点検 ─────────
+      #   Windows で一度も動かしていないため、ここで動かして終了コードと最後の 20 行を記録に残す。
+      #   止めない手順 (continue-on-error)。配信の判定 (自己診断・証跡) は変えない。
+      - name: 知らない問題を解く仕組みの自己点検 (止めない・記録だけ)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          NS="$USERPROFILE/.soloptilink/lib/novel-solve/novel-solve.sh"
+          if [ ! -f "$NS" ]; then echo "novel-solve.sh is not placed in this version. Skipped (not a pass)."; exit 0; fi
+          set +e
+          timeout 900 bash "$NS" selftest > "$RUNNER_TEMP/novel-solve-selftest.log" 2>&1
+          RC=$?
+          set -e
+          echo "novel-solve selftest exit code: $RC"
+          echo "--- last 20 lines ---"
+          tail -n 20 "$RUNNER_TEMP/novel-solve-selftest.log"
+          if [ "$RC" -ne 0 ]; then echo "::warning::novel-solve selftest exit code $RC (recorded only; the release verdict is unchanged)"; fi
+
       - name: 自己診断の判定を読む
         id: verdict
         shell: powershell
@@ -607,6 +626,7 @@ jobs:
             ${{ runner.temp }}/install.log
             ${{ runner.temp }}/selfcheck.json
             ${{ runner.temp }}/selfcheck.err
+            ${{ runner.temp }}/novel-solve-selftest.log
           retention-days: 30
           if-no-files-found: warn
 
@@ -699,12 +719,34 @@ jobs:
           }
           Write-Host "No halt under the cp932 approximation, and skills were placed. (NOT equivalent to a real Japanese Windows.)"
 
+      # 知らない問題を解く仕組みの自己点検を、出力の文字コードを cp932 に寄せた状態でも動かす (止めない・記録だけ)
+      - name: 知らない問題を解く仕組みの自己点検 (cp932 の近似・止めない)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        shell: bash
+        env:
+          PYTHONIOENCODING: "cp932"
+        run: |
+          chcp.com 932 > /dev/null 2>&1 || true
+          NS="$USERPROFILE/.soloptilink/lib/novel-solve/novel-solve.sh"
+          if [ ! -f "$NS" ]; then echo "novel-solve.sh is not placed in this version. Skipped (not a pass)."; exit 0; fi
+          set +e
+          timeout 900 bash "$NS" selftest > "$RUNNER_TEMP/novel-solve-selftest-932.log" 2>&1
+          RC=$?
+          set -e
+          echo "novel-solve selftest (cp932 approximation) exit code: $RC"
+          echo "--- last 20 lines ---"
+          tail -n 20 "$RUNNER_TEMP/novel-solve-selftest-932.log"
+          if [ "$RC" -ne 0 ]; then echo "::warning::novel-solve selftest under cp932 approximation exit code $RC (recorded only)"; fi
+
       - name: ログを保存
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-cp932-log-${{ inputs.version }}
-          path: ${{ runner.temp }}/install-932.log
+          path: |
+            ${{ runner.temp }}/install-932.log
+            ${{ runner.temp }}/novel-solve-selftest-932.log
           retention-days: 30
           if-no-files-found: warn
 
